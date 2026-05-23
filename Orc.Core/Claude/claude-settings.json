@@ -1,0 +1,16 @@
+{
+    "permissions": {
+        "defaultMode": "acceptEdits",
+        "allow": [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "Read",
+            "Glob",
+            "Grep",
+            "Bash(dotnet build:*)",
+            "Bash(dotnet test:*)"
+        ],
+        "deny": []
+    }
+}

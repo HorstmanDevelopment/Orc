@@ -1,0 +1,126 @@
+using System.Text.Json;
+using Orc.Core.Configuration;
+
+namespace Orc.Core.Repos;
+
+internal sealed class RepoRegistry : IRepoRegistry
+{
+    private const string AllToken = "all";
+
+    private readonly WorkspaceLayout _layout;
+    private readonly object _lock = new();
+
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        WriteIndented = true,
+        PropertyNameCaseInsensitive = true,
+        ReadCommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true,
+    };
+
+    public RepoRegistry(WorkspaceLayout layout)
+    {
+        _layout = layout;
+    }
+
+    public string SourcePath => _layout.ReposJsonPath;
+
+    public IReadOnlyList<RepoEntry> All()
+    {
+        var raw = LoadRaw();
+        return raw.Select(r => new RepoEntry(
+            DeriveName(r.Url),
+            r.Url,
+            string.IsNullOrWhiteSpace(r.Branch) ? "main" : r.Branch.Trim(),
+            Path.Combine(_layout.ReposDir, DeriveName(r.Url)))).ToArray();
+    }
+
+    public bool Contains(string url) =>
+        LoadRaw().Any(r => string.Equals(r.Url, url, StringComparison.OrdinalIgnoreCase));
+
+    public bool TryResolve(string spec, out IReadOnlyList<RepoEntry> repos, out string? error)
+    {
+        var all = All();
+
+        if (string.Equals(spec, AllToken, StringComparison.OrdinalIgnoreCase))
+        {
+            if (all.Count == 0)
+            {
+                repos = [];
+                error = $"'all' specified but {Path.GetFileName(SourcePath)} is empty.";
+                return false;
+            }
+            repos = all;
+            error = null;
+            return true;
+        }
+
+        var names = spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var resolved = new List<RepoEntry>(names.Length);
+        var missing = new List<string>();
+        foreach (var n in names)
+        {
+            var match = all.FirstOrDefault(r => string.Equals(r.Name, n, StringComparison.OrdinalIgnoreCase));
+            if (match is null) missing.Add(n);
+            else resolved.Add(match);
+        }
+        if (missing.Count > 0)
+        {
+            repos = [];
+            error = $"Repo(s) not in registry: {string.Join(", ", missing)}";
+            return false;
+        }
+
+        repos = resolved;
+        error = null;
+        return true;
+    }
+
+    public Task AddAsync(string url, string branch, CancellationToken ct)
+    {
+        lock (_lock)
+        {
+            var list = LoadRaw();
+            if (list.Any(r => string.Equals(r.Url, url, StringComparison.OrdinalIgnoreCase))) return Task.CompletedTask;
+            list.Add(new RawEntry { Url = url, Branch = branch });
+            Save(list);
+        }
+        return Task.CompletedTask;
+    }
+
+    private List<RawEntry> LoadRaw()
+    {
+        if (!File.Exists(SourcePath)) return [];
+        try
+        {
+            var text = File.ReadAllText(SourcePath);
+            if (string.IsNullOrWhiteSpace(text)) return [];
+            return JsonSerializer.Deserialize<List<RawEntry>>(text, JsonOpts) ?? [];
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private void Save(List<RawEntry> list)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(SourcePath)!);
+        File.WriteAllText(SourcePath, JsonSerializer.Serialize(list, JsonOpts));
+    }
+
+    private static string DeriveName(string url)
+    {
+        var trimmed = url.TrimEnd('/');
+        var slash = trimmed.LastIndexOf('/');
+        var name = slash >= 0 ? trimmed[(slash + 1)..] : trimmed;
+        if (name.EndsWith(".git", StringComparison.OrdinalIgnoreCase)) name = name[..^4];
+        return name;
+    }
+
+    private sealed class RawEntry
+    {
+        public string Url { get; set; } = "";
+        public string Branch { get; set; } = "main";
+    }
+}
