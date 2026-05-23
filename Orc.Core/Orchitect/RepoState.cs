@@ -12,7 +12,6 @@ public sealed class Enhancement
     public string Id { get; set; } = "";
     public string Title { get; set; } = "";
     public string Rationale { get; set; } = "";
-    public int Priority { get; set; } = 3;
     public EnhancementStatus Status { get; set; } = EnhancementStatus.Identified;
     public List<EnhancementStep> Steps { get; set; } = [];
 }

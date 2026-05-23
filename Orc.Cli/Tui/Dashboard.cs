@@ -1,4 +1,5 @@
 using Orc.Cli.Forms;
+using Orc.Core.Configuration;
 using Orc.Core.Orchitect;
 using Orc.Core.Repos;
 using Orc.Core.Tasks;
@@ -11,12 +12,16 @@ public sealed class Dashboard
     private readonly ITaskStore _tasks;
     private readonly IRepoRegistry _registry;
     private readonly IOrchitectControl _orchitect;
+    private readonly IGitClient _git;
+    private readonly WorkspaceLayout _layout;
 
-    public Dashboard(ITaskStore tasks, IRepoRegistry registry, IOrchitectControl orchitect)
+    public Dashboard(ITaskStore tasks, IRepoRegistry registry, IOrchitectControl orchitect, IGitClient git, WorkspaceLayout layout)
     {
         _tasks = tasks;
         _registry = registry;
         _orchitect = orchitect;
+        _git = git;
+        _layout = layout;
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -63,6 +68,8 @@ public sealed class Dashboard
                 "",
                 [
                     "Add repository",
+                    "Create new repo",
+                    "Edit repo mission",
                     "View task history",
                     "View installed repos",
                     "Orchitect status",
@@ -79,6 +86,12 @@ public sealed class Dashboard
                 case "Add repository":
                     await RunPageAsync(() => new AddRepoForm(_registry).RunAsync(ct));
                     break;
+                case "Create new repo":
+                    await RunPageAsync(() => new CreateRepoForm(_registry, _git, _layout).RunAsync(ct));
+                    break;
+                case "Edit repo mission":
+                    await RunPageAsync(() => new EditMissionForm(_registry).RunAsync(ct));
+                    break;
                 case "View task history":
                     await RunPageAsync(() => new TaskHistoryForm(_tasks).RunAsync(ct));
                     break;
@@ -86,7 +99,7 @@ public sealed class Dashboard
                     RunPage(() => new RepoListForm(_registry).Run());
                     break;
                 case "Orchitect status":
-                    RunPage(() => new OrchitectStatusForm(_orchitect).Run());
+                    RunPage(() => new OrchitectStatusForm(_orchitect, _registry).Run());
                     break;
                 case "Pause Orchitect":
                     _orchitect.Pause();

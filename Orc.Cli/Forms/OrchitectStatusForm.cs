@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Options;
 using Orc.Core.Configuration;
 using Orc.Core.Orchitect;
+using Orc.Core.Repos;
 using Spectre.Console;
 
 namespace Orc.Cli.Forms;
@@ -8,8 +9,13 @@ namespace Orc.Cli.Forms;
 public sealed class OrchitectStatusForm
 {
     private readonly IOrchitectControl _orchitect;
+    private readonly IRepoRegistry _registry;
 
-    public OrchitectStatusForm(IOrchitectControl orchitect) => _orchitect = orchitect;
+    public OrchitectStatusForm(IOrchitectControl orchitect, IRepoRegistry registry)
+    {
+        _orchitect = orchitect;
+        _registry = registry;
+    }
 
     public void Run()
     {
@@ -33,38 +39,44 @@ public sealed class OrchitectStatusForm
             return;
         }
 
+        var registered = _registry.All();
+
         foreach (var repoName in repos)
         {
             var state = _orchitect.LoadState(repoName);
             var today = snap.PerRepo.TryGetValue(repoName, out var n) ? n : 0;
+            var mission = registered
+                .FirstOrDefault(r => string.Equals(r.Name, repoName, StringComparison.OrdinalIgnoreCase))
+                ?.Mission;
 
             var table = new Table()
                 .Border(TableBorder.Minimal)
                 .Expand()
                 .AddColumn("[yellow]ID[/]")
-                .AddColumn("[yellow]Pri[/]")
                 .AddColumn("[yellow]Status[/]")
                 .AddColumn("[yellow]Steps[/]")
                 .AddColumn("[yellow]Title[/]");
 
             if (state.Enhancements.Count == 0)
-                table.AddRow("[grey](no enhancements yet)[/]", "", "", "", "");
+                table.AddRow("[grey](no enhancements yet)[/]", "", "", "");
             else
             {
-                foreach (var e in state.Enhancements.OrderBy(x => x.Priority))
+                foreach (var e in state.Enhancements.OrderBy(x => x.Id, StringComparer.Ordinal))
                     table.AddRow(
                         Markup.Escape(e.Id),
-                        e.Priority.ToString(),
                         Color(e.Status),
                         SummarizeSteps(e),
                         Markup.Escape(Truncate(e.Title, 60)));
             }
 
             var last = state.LastAnalyzedUtc?.ToString("u") ?? "never";
-            AnsiConsole.Write(new Panel(table)
+            var panel = new Panel(table)
                 .Border(BoxBorder.Rounded)
                 .Header($"[bold yellow]{Markup.Escape(repoName)}[/]  [grey]today {today} · last analyzed {Markup.Escape(last)}[/]", Justify.Left)
-                .Expand());
+                .Expand();
+            AnsiConsole.Write(panel);
+            if (!string.IsNullOrWhiteSpace(mission))
+                AnsiConsole.MarkupLine($"  [grey]Mission:[/] [italic]{Markup.Escape(Truncate(mission, 100))}[/]");
             AnsiConsole.WriteLine();
         }
     }

@@ -129,7 +129,7 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
                     if (!_quota.CanModify(repo.Name)) { await DelayUntilNextDayAsync(ct); continue; }
 
                     _logger.LogInformation("[{Repo}] analyzing", repo.Name);
-                    var (enhancements, raw) = await _analysis.RunAsync(repo.LocalPath, ct);
+                    var (enhancements, raw) = await _analysis.RunAsync(repo.LocalPath, repo.Mission, ct);
                     try { await File.WriteAllTextAsync(_state.AnalysisPath(repo.Name), raw, ct); } catch { }
                     state.LastAnalyzedUtc = DateTime.UtcNow;
 
@@ -156,7 +156,7 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
                 if (enh is null) { await Task.Delay(TimeSpan.FromMinutes(5), ct); continue; }
 
                 _logger.LogInformation("[{Repo}] planning step for {Id} '{Title}'", repo.Name, enh.Id, enh.Title);
-                var plan = await _planner.PlanAsync(repo.LocalPath, enh, ct);
+                var plan = await _planner.PlanAsync(repo.LocalPath, enh, repo.Mission, ct);
                 if (plan.IsComplete)
                 {
                     enh.Status = EnhancementStatus.Completed;
@@ -233,8 +233,8 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
     }
 
     private static Enhancement? PickEnhancement(RepoState state) =>
-        state.Enhancements.Where(e => e.Status == EnhancementStatus.InProgress).OrderBy(e => e.Priority).FirstOrDefault()
-        ?? state.Enhancements.Where(e => e.Status == EnhancementStatus.Identified).OrderBy(e => e.Priority).FirstOrDefault();
+        state.Enhancements.Where(e => e.Status == EnhancementStatus.InProgress).OrderBy(e => e.Id, StringComparer.Ordinal).FirstOrDefault()
+        ?? state.Enhancements.Where(e => e.Status == EnhancementStatus.Identified).OrderBy(e => e.Id, StringComparer.Ordinal).FirstOrDefault();
 
     private static async Task DelayUntilNextDayAsync(CancellationToken ct)
     {

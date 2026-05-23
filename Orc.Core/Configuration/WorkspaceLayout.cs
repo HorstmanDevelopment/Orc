@@ -16,7 +16,28 @@ public sealed class WorkspaceLayout
 
     public WorkspaceLayout(IOptions<WorkspaceOptions> options)
     {
-        Root = Path.GetFullPath(options.Value.Root);
+        Root = ResolveRoot(options.Value.Root);
+    }
+
+    private static string ResolveRoot(string configured)
+    {
+        if (Path.IsPathFullyQualified(configured))
+            return Path.GetFullPath(configured);
+
+        var anchor = FindProjectRoot() ?? Directory.GetCurrentDirectory();
+        return Path.GetFullPath(Path.Combine(anchor, configured));
+    }
+
+    private static string? FindProjectRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            if (Directory.Exists(Path.Combine(dir.FullName, ".git")))
+                return dir.FullName;
+            dir = dir.Parent;
+        }
+        return null;
     }
 
     public void EnsureCreated()

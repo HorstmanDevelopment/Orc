@@ -1,4 +1,5 @@
-using System.Text.Json;
+using System.Text;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Orc.Core.Claude;
 using Orc.Core.Configuration;
@@ -7,74 +8,81 @@ namespace Orc.Core.Orchitect;
 
 internal sealed class AnalysisRunner
 {
-    private const string PromptTemplate = """
-        Analyze this codebase to identify enhancements. Read the project structure and key files using Read, Glob, and Grep.
-
-        Output ONLY a JSON array (no commentary, no markdown fences) of 3-7 distinct enhancement suggestions in this exact format:
-
-        [
-          {
-            "title": "short title",
-            "rationale": "1-2 sentences explaining why this is valuable",
-            "priority": 3
-          }
-        ]
-
-        Each enhancement should be:
-        - A meaningful improvement (code quality, missing features, testing, performance, developer experience)
-        - Achievable through code changes only (no external infrastructure)
-        - Distinct from the others
-
-        Priority: 1 = highest, 5 = lowest. Do not include any text outside the JSON array.
-        """;
-
-    private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };
-
+    public const string OutputDirName = "claude_output";
+    private const string PromptBody = $"You are an automated code development plan generator. Scan the code base in this directory and identify next steps for development. For each step, create a separate file in the `./{OutputDirName}/` directory with a short kebab-case name describing the step like `short-description-of-step.txt`. The content should be a few sentences describing a high level summary of the step. Examples of steps could be basic building blocks to get the app running, new features, new content etc. Each should be relevant to the mission statement. Respond with a list of files created. If you can't write files, describe why.";
     private readonly IClaudeClient _claude;
     private readonly OrchitectOptions _options;
+    private readonly ILogger<AnalysisRunner> _logger;
 
-    public AnalysisRunner(IClaudeClient claude, IOptions<OrchitectOptions> options)
+    public AnalysisRunner(IClaudeClient claude, IOptions<OrchitectOptions> options, ILogger<AnalysisRunner> logger)
     {
         _claude = claude;
         _options = options.Value;
+        _logger = logger;
     }
 
-    public async Task<(IReadOnlyList<Enhancement> Enhancements, string Raw)> RunAsync(string repoPath, CancellationToken ct)
+    public async Task<(IReadOnlyList<Enhancement> Enhancements, string Raw)> RunAsync(string repoPath, string? mission, CancellationToken ct)
     {
-        var r = await _claude.RunAsync(repoPath, PromptTemplate, _options.ReadOnlyTools, ct);
-        var raw = $"--- claude exit={r.ExitCode} ---\n{r.Transcript}";
-        var json = JsonExtractor.ExtractFirstObjectOrArray(r.StdOut);
-        if (json is null) return ([], raw);
+        var outDir = Path.Combine(repoPath, OutputDirName);
+        ClaudeOutputDir.Reset(outDir);
 
-        try
+        var prompt = PromptBody+" The plan for the code base is :"+mission;//MissionPreamble.BuildAnalysisPrompt(mission, PromptBody);
+        var r = await _claude.RunAsync(repoPath, prompt, _options.AnalysisTools, ct);
+
+        var files = ClaudeOutputDir.ListFiles(outDir);
+        var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+        var enhancements = new List<Enhancement>(files.Count);
+        var manifest = new StringBuilder();
+
+        for (var i = 0; i < files.Count; i++)
         {
-            var items = JsonSerializer.Deserialize<List<Item>>(json, JsonOpts) ?? [];
-            var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
-            var result = new List<Enhancement>(items.Count);
-            for (var i = 0; i < items.Count; i++)
+            var file = files[i];
+            string content;
+            try
             {
-                var it = items[i];
-                if (string.IsNullOrWhiteSpace(it.Title)) continue;
-                result.Add(new Enhancement
-                {
-                    Id = $"enh-{stamp}-{i + 1:D2}",
-                    Title = it.Title!.Trim(),
-                    Rationale = (it.Rationale ?? "").Trim(),
-                    Priority = it.Priority == 0 ? 3 : it.Priority,
-                });
+                content = await File.ReadAllTextAsync(file, ct);
             }
-            return (result, raw);
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "could not read {File}; skipping", file);
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                _logger.LogWarning("skipping empty enhancement file {File}", file);
+                continue;
+            }
+
+            var title = SanitizeTitle(Path.GetFileNameWithoutExtension(file));
+            if (string.IsNullOrEmpty(title)) continue;
+
+            enhancements.Add(new Enhancement
+            {
+                Id = $"enh-{stamp}-{enhancements.Count + 1:D2}",
+                Title = title,
+                Rationale = content.Trim(),
+            });
+
+            manifest.AppendLine($"{Path.GetFileName(file)} ({new FileInfo(file).Length}B)");
         }
-        catch
-        {
-            return ([], raw);
-        }
+
+        var raw = $"--- claude exit={r.ExitCode} files={enhancements.Count} ---\n{r.Transcript}\n--- manifest ---\n{manifest}";
+
+        ClaudeOutputDir.Reset(outDir);
+        return (enhancements, raw);
     }
 
-    private sealed class Item
+    private static string SanitizeTitle(string raw)
     {
-        public string? Title { get; set; }
-        public string? Rationale { get; set; }
-        public int Priority { get; set; }
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        var sb = new StringBuilder(raw.Length);
+        foreach (var ch in raw)
+        {
+            if (char.IsControl(ch)) continue;
+            sb.Append(ch);
+        }
+        var s = sb.ToString().Trim();
+        return s.Length > 80 ? s[..80] : s;
     }
 }

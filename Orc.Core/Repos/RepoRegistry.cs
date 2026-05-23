@@ -28,15 +28,26 @@ internal sealed class RepoRegistry : IRepoRegistry
     public IReadOnlyList<RepoEntry> All()
     {
         var raw = LoadRaw();
-        return raw.Select(r => new RepoEntry(
-            DeriveName(r.Url),
-            r.Url,
-            string.IsNullOrWhiteSpace(r.Branch) ? "main" : r.Branch.Trim(),
-            Path.Combine(_layout.ReposDir, DeriveName(r.Url)))).ToArray();
+        return raw.Select(r =>
+        {
+            var name = ResolveName(r);
+            return new RepoEntry(
+                name,
+                r.Url ?? "",
+                string.IsNullOrWhiteSpace(r.Branch) ? "main" : r.Branch.Trim(),
+                Path.Combine(_layout.ReposDir, name),
+                string.IsNullOrWhiteSpace(r.Mission) ? null : r.Mission.Trim());
+        }).ToArray();
     }
 
     public bool Contains(string url) =>
-        LoadRaw().Any(r => string.Equals(r.Url, url, StringComparison.OrdinalIgnoreCase));
+        !string.IsNullOrWhiteSpace(url) &&
+        LoadRaw().Any(r => !string.IsNullOrWhiteSpace(r.Url) &&
+                           string.Equals(r.Url, url, StringComparison.OrdinalIgnoreCase));
+
+    public bool ContainsName(string name) =>
+        !string.IsNullOrWhiteSpace(name) &&
+        LoadRaw().Any(r => string.Equals(ResolveName(r), name.Trim(), StringComparison.OrdinalIgnoreCase));
 
     public bool TryResolve(string spec, out IReadOnlyList<RepoEntry> repos, out string? error)
     {
@@ -76,17 +87,50 @@ internal sealed class RepoRegistry : IRepoRegistry
         return true;
     }
 
-    public Task AddAsync(string url, string branch, CancellationToken ct)
+    public Task AddAsync(string url, string branch, CancellationToken ct, string? mission = null)
     {
         lock (_lock)
         {
             var list = LoadRaw();
-            if (list.Any(r => string.Equals(r.Url, url, StringComparison.OrdinalIgnoreCase))) return Task.CompletedTask;
-            list.Add(new RawEntry { Url = url, Branch = branch });
+            if (list.Any(r => !string.IsNullOrWhiteSpace(r.Url) &&
+                              string.Equals(r.Url, url, StringComparison.OrdinalIgnoreCase))) return Task.CompletedTask;
+            list.Add(new RawEntry { Url = url, Branch = branch, Mission = NormalizeMission(mission) });
             Save(list);
         }
         return Task.CompletedTask;
     }
+
+    public Task AddLocalAsync(string name, string branch, CancellationToken ct, string? mission = null)
+    {
+        var trimmed = name.Trim();
+        lock (_lock)
+        {
+            var list = LoadRaw();
+            if (list.Any(r => string.Equals(ResolveName(r), trimmed, StringComparison.OrdinalIgnoreCase)))
+                return Task.CompletedTask;
+            list.Add(new RawEntry { Url = "", Branch = branch, Name = trimmed, Mission = NormalizeMission(mission) });
+            Save(list);
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task UpdateMissionAsync(string name, string? mission, CancellationToken ct)
+    {
+        var trimmedName = name.Trim();
+        lock (_lock)
+        {
+            var list = LoadRaw();
+            var entry = list.FirstOrDefault(r =>
+                string.Equals(ResolveName(r), trimmedName, StringComparison.OrdinalIgnoreCase));
+            if (entry is null) return Task.CompletedTask;
+            entry.Mission = NormalizeMission(mission);
+            Save(list);
+        }
+        return Task.CompletedTask;
+    }
+
+    private static string? NormalizeMission(string? mission) =>
+        string.IsNullOrWhiteSpace(mission) ? null : mission.Trim();
 
     private List<RawEntry> LoadRaw()
     {
@@ -109,6 +153,9 @@ internal sealed class RepoRegistry : IRepoRegistry
         File.WriteAllText(SourcePath, JsonSerializer.Serialize(list, JsonOpts));
     }
 
+    private static string ResolveName(RawEntry r) =>
+        !string.IsNullOrWhiteSpace(r.Name) ? r.Name.Trim() : DeriveName(r.Url ?? "");
+
     private static string DeriveName(string url)
     {
         var trimmed = url.TrimEnd('/');
@@ -122,5 +169,7 @@ internal sealed class RepoRegistry : IRepoRegistry
     {
         public string Url { get; set; } = "";
         public string Branch { get; set; } = "main";
+        public string? Name { get; set; }
+        public string? Mission { get; set; }
     }
 }

@@ -89,4 +89,84 @@ public class RepoRegistryTests
         var all = reg.All();
         Assert.Equal(2, all.Count);
     }
+
+    [Fact]
+    public async Task AddAsync_persists_mission()
+    {
+        using var ws = new TempWorkspace();
+        var reg = Build(ws);
+        await reg.AddAsync("https://example.com/org/foo.git", "main", CancellationToken.None, mission: "Make logs structured.");
+        var entry = reg.All().Single();
+        Assert.Equal("Make logs structured.", entry.Mission);
+    }
+
+    [Fact]
+    public async Task AddLocalAsync_persists_mission()
+    {
+        using var ws = new TempWorkspace();
+        var reg = Build(ws);
+        await reg.AddLocalAsync("foo", "main", CancellationToken.None, mission: "Ship a CLI v1.");
+        Assert.Equal("Ship a CLI v1.", reg.All().Single().Mission);
+    }
+
+    [Fact]
+    public async Task AddAsync_without_mission_yields_null()
+    {
+        using var ws = new TempWorkspace();
+        var reg = Build(ws);
+        await reg.AddAsync("https://example.com/org/foo.git", "main", CancellationToken.None);
+        Assert.Null(reg.All().Single().Mission);
+    }
+
+    [Fact]
+    public async Task AddAsync_whitespace_mission_normalized_to_null()
+    {
+        using var ws = new TempWorkspace();
+        var reg = Build(ws);
+        await reg.AddAsync("https://example.com/org/foo.git", "main", CancellationToken.None, mission: "   ");
+        Assert.Null(reg.All().Single().Mission);
+    }
+
+    [Fact]
+    public async Task UpdateMissionAsync_replaces_then_clears()
+    {
+        using var ws = new TempWorkspace();
+        var reg = Build(ws);
+        await reg.AddLocalAsync("foo", "main", CancellationToken.None, mission: "Original");
+
+        await reg.UpdateMissionAsync("foo", "Revised", CancellationToken.None);
+        Assert.Equal("Revised", reg.All().Single().Mission);
+
+        await reg.UpdateMissionAsync("foo", null, CancellationToken.None);
+        Assert.Null(reg.All().Single().Mission);
+
+        await reg.UpdateMissionAsync("foo", "   ", CancellationToken.None);
+        Assert.Null(reg.All().Single().Mission);
+    }
+
+    [Fact]
+    public async Task UpdateMissionAsync_unknown_repo_is_noop()
+    {
+        using var ws = new TempWorkspace();
+        var reg = Build(ws);
+        await reg.AddLocalAsync("foo", "main", CancellationToken.None);
+        await reg.UpdateMissionAsync("does-not-exist", "x", CancellationToken.None);
+        Assert.Null(reg.All().Single().Mission);
+    }
+
+    [Fact]
+    public async Task Reads_legacy_json_without_mission_field()
+    {
+        using var ws = new TempWorkspace();
+        var path = ws.Layout.ReposJsonPath;
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await File.WriteAllTextAsync(path, """
+            [
+              { "url": "https://example.com/a/x.git", "branch": "main" }
+            ]
+            """);
+        var reg = Build(ws);
+        var entry = reg.All().Single();
+        Assert.Null(entry.Mission);
+    }
 }
