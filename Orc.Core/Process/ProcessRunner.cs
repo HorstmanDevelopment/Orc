@@ -15,7 +15,8 @@ internal sealed class ProcessRunner : IProcessRunner
         IReadOnlyList<string> args,
         string workingDir,
         TimeSpan? timeout,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? stdin = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -23,6 +24,7 @@ internal sealed class ProcessRunner : IProcessRunner
             WorkingDirectory = workingDir,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            RedirectStandardInput = stdin is not null,
             UseShellExecute = false,
             CreateNoWindow = true,
         };
@@ -38,6 +40,25 @@ internal sealed class ProcessRunner : IProcessRunner
         proc.Start();
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
+
+        if (stdin is not null)
+        {
+            // Feed input (e.g. a large prompt that would overflow the command line) then
+            // close the stream so the child sees EOF and proceeds.
+            try
+            {
+                await proc.StandardInput.WriteAsync(stdin.AsMemory(), ct);
+                await proc.StandardInput.FlushAsync(ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                stdErr.AppendLine($"[stdin write failed: {ex.Message}]");
+            }
+            finally
+            {
+                try { proc.StandardInput.Close(); } catch { }
+            }
+        }
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
         if (timeout is { } t) linked.CancelAfter(t);

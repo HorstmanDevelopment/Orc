@@ -32,19 +32,22 @@ internal sealed class ClaudeClient : IClaudeClient
     {
         EnsureSettingsFile(repoPath);
         var tools = allowedTools ?? _options.DefaultAllowedTools;
-        var (exe, args) = BuildCommand(prompt, tools);
-        var pr = await _runner.RunAsync(exe, args, repoPath, _options.Timeout, ct);
+        var (exe, args) = BuildCommand(tools);
+        // The prompt goes over stdin, not the command line: orchitect prompts routinely
+        // exceed the Windows ~8KB command-line limit ("The command line is too long").
+        var pr = await _runner.RunAsync(exe, args, repoPath, _options.Timeout, ct, stdin: prompt);
         _logger.LogInformation(
             "Claude in {Repo} exit={Exit} stdOut={StdOut}B stdErr={StdErr}B",
             repoPath, pr.ExitCode, pr.StdOut.Length, pr.StdErr.Length);
         return new ClaudeRunResult(pr.ExitCode, pr.StdOut, pr.StdErr);
     }
 
-    private (string Exe, List<string> Args) BuildCommand(string prompt, IReadOnlyList<string> tools)
+    private (string Exe, List<string> Args) BuildCommand(IReadOnlyList<string> tools)
     {
+        // -p with no inline prompt makes claude read the prompt from stdin (see RunAsync).
         var claudeArgs = new List<string>
         {
-            "-p", prompt,
+            "-p",
             "--permission-mode", _options.PermissionMode,
             "--allowedTools", string.Join(" ", tools),
         };

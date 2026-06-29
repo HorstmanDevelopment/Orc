@@ -7,5 +7,6 @@ public interface IProcessRunner
         IReadOnlyList<string> args,
         string workingDir,
         TimeSpan? timeout,
-        CancellationToken ct);
+        CancellationToken ct,
+        string? stdin = null);
 }
