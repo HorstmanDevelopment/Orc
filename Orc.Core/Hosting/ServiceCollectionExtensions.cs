@@ -23,13 +23,16 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IClaudeClient, ClaudeClient>();
         services.AddSingleton<IGitClient, GitClient>();
         services.AddSingleton<IRepoRegistry, RepoRegistry>();
+        services.AddSingleton<IRepoLock, RepoLock>();
         services.AddSingleton<ITaskStore, JsonTaskStore>();
+        services.AddSingleton<IRunningTaskRegistry, RunningTaskRegistry>();
 
         services.AddSingleton<RefreshRepoStage>();
         services.AddSingleton<GuardUnmergedBranchStage>();
         services.AddSingleton<CreateBranchStage>();
         services.AddSingleton<RunClaudeStage>();
         services.AddSingleton<CommitStage>();
+        services.AddSingleton<MergeStage>();
         services.AddSingleton<ITaskRunner, TaskRunner>();
 
         services.AddHostedService<OrchestratorService>();

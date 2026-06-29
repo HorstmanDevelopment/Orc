@@ -13,22 +13,26 @@ public interface ITaskRunner
 internal sealed class TaskRunner : ITaskRunner
 {
     private readonly IRepoRegistry _repos;
+    private readonly IRepoLock _repoLock;
     private readonly IReadOnlyList<IStage> _stages;
     private readonly WorkspaceLayout _layout;
     private readonly ILogger<TaskRunner> _logger;
 
     public TaskRunner(
         IRepoRegistry repos,
+        IRepoLock repoLock,
         RefreshRepoStage refresh,
         GuardUnmergedBranchStage guard,
         CreateBranchStage branch,
         RunClaudeStage claude,
         CommitStage commit,
+        MergeStage merge,
         WorkspaceLayout layout,
         ILogger<TaskRunner> logger)
     {
         _repos = repos;
-        _stages = [refresh, guard, branch, claude, commit];
+        _repoLock = repoLock;
+        _stages = [refresh, guard, branch, claude, commit, merge];
         _layout = layout;
         _logger = logger;
     }
@@ -47,11 +51,27 @@ internal sealed class TaskRunner : ITaskRunner
 
         var allOk = perRepo.All(r => r.ExitCode == 0);
         var anyChanges = perRepo.Any(r => r.HasChanges);
-        return new TaskOutcome(allOk, anyChanges, perRepo, null);
+        var reason = allOk ? null : SummarizeFailures(perRepo);
+        return new TaskOutcome(allOk, anyChanges, perRepo, reason);
+    }
+
+    private static string SummarizeFailures(IReadOnlyList<RepoResult> perRepo)
+    {
+        var failed = perRepo.Where(r => r.ExitCode != 0).ToArray();
+        if (failed.Length == 0) return "task failed";
+
+        return string.Join("; ", failed.Select(r =>
+        {
+            var stage = r.FailedStage is { Length: > 0 } s ? $" [{s}]" : "";
+            var why = r.FailReason is { Length: > 0 } w ? $": {w}" : $" (exit {r.ExitCode})";
+            return $"{r.RepoName}{stage}{why}";
+        }));
     }
 
     private async Task<RepoResult> RunRepoAsync(TaskRecord task, RepoEntry repo, string branchName, string stamp, CancellationToken ct)
     {
+        await using var _ = await _repoLock.AcquireAsync(repo.Name, ct);
+
         var ctx = new PipelineContext
         {
             Task = task,
@@ -60,6 +80,8 @@ internal sealed class TaskRunner : ITaskRunner
             Stamp = stamp,
         };
         var exit = 0;
+        string? failedStage = null;
+        string? failReason = null;
 
         try
         {
@@ -72,6 +94,8 @@ internal sealed class TaskRunner : ITaskRunner
                     {
                         _logger.LogWarning("Stage {Stage} aborted on {Repo}: {Reason}", stage.Name, repo.Name, r.Reason);
                         exit = exit == 0 ? -1 : exit;
+                        failedStage = stage.Name;
+                        failReason = r.Reason ?? $"stage {stage.Name} aborted";
                         break;
                     }
                     if (r.StopPipeline) break;
@@ -83,6 +107,8 @@ internal sealed class TaskRunner : ITaskRunner
                     ctx.Transcript.AppendLine($"--- {stage.Name} EXCEPTION ---");
                     ctx.Transcript.AppendLine(ex.ToString());
                     exit = exit == 0 ? -2 : exit;
+                    failedStage = stage.Name;
+                    failReason = $"{stage.Name} threw: {ex.Message}";
                     break;
                 }
             }
@@ -94,7 +120,7 @@ internal sealed class TaskRunner : ITaskRunner
             ctx.PerRepoLogPath = await PersistTranscriptAsync(task, repo, ctx, ct);
         }
 
-        return new RepoResult(repo.Name, exit, ctx.HasChanges, branchName, ctx.PerRepoLogPath);
+        return new RepoResult(repo.Name, exit, ctx.HasChanges, branchName, ctx.PerRepoLogPath, failedStage, failReason);
     }
 
     private async Task<string> PersistTranscriptAsync(TaskRecord task, RepoEntry repo, PipelineContext ctx, CancellationToken ct)

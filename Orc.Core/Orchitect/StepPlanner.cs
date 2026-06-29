@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Orc.Core.Claude;
 using Orc.Core.Configuration;
+using Orc.Core.Repos;
 
 namespace Orc.Core.Orchitect;
 
@@ -14,18 +15,22 @@ public sealed class StepPlanResult
 internal sealed class StepPlanner
 {
     private readonly IClaudeClient _claude;
+    private readonly IRepoLock _repoLock;
     private readonly OrchitectOptions _options;
     private readonly ILogger<StepPlanner> _logger;
 
-    public StepPlanner(IClaudeClient claude, IOptions<OrchitectOptions> options, ILogger<StepPlanner> logger)
+    public StepPlanner(IClaudeClient claude, IRepoLock repoLock, IOptions<OrchitectOptions> options, ILogger<StepPlanner> logger)
     {
         _claude = claude;
+        _repoLock = repoLock;
         _options = options.Value;
         _logger = logger;
     }
 
-    public async Task<StepPlanResult> PlanAsync(string repoPath, Enhancement enh, string? mission, CancellationToken ct)
+    public async Task<StepPlanResult> PlanAsync(string repoName, string repoPath, Enhancement enh, string? mission, CancellationToken ct)
     {
+        await using var repoLockHandle = await _repoLock.AcquireAsync(repoName, ct);
+
         var outDir = Path.Combine(repoPath, AnalysisRunner.OutputDirName);
         ClaudeOutputDir.Reset(outDir);
 
@@ -58,8 +63,10 @@ internal sealed class StepPlanner
             - Do NOT write files anywhere except under `./{{AnalysisRunner.OutputDirName}}/`.
             - Do NOT create subdirectories inside `./{{AnalysisRunner.OutputDirName}}/`.
             """;
+        body = body.Replace("\n"," ");
 
-        var prompt = MissionPreamble.BuildPlanningPrompt(mission, body);
+        var prompt = body+" The mission for this repository is :"+mission;//MissionPreamble.BuildStepPrompt(mission, body);
+        
         _ = await _claude.RunAsync(repoPath, prompt, _options.AnalysisTools, ct);
 
         var files = ClaudeOutputDir.ListFiles(outDir);

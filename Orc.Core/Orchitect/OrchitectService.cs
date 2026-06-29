@@ -69,6 +69,21 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
         _state.Save(repoName, s);
     }
 
+    public void ResetState(string repoName)
+    {
+        _state.Reset(repoName);
+
+        var repo = _registry.All().FirstOrDefault(r => string.Equals(r.Name, repoName, StringComparison.OrdinalIgnoreCase));
+        if (repo is not null)
+        {
+            var outDir = Path.Combine(repo.LocalPath, AnalysisRunner.OutputDirName);
+            try { if (Directory.Exists(outDir)) Directory.Delete(outDir, recursive: true); }
+            catch (Exception ex) { _logger.LogWarning(ex, "could not clear {Dir} during reset", outDir); }
+        }
+
+        _logger.LogInformation("[{Repo}] Orchitect state reset", repoName);
+    }
+
     public QuotaSnapshot QuotaSnapshot() => _quota.Snapshot();
     public IReadOnlyList<string> ListRepos() => _state.ListRepos();
     public RepoState LoadState(string repoName) => _state.Load(repoName);
@@ -129,7 +144,7 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
                     if (!_quota.CanModify(repo.Name)) { await DelayUntilNextDayAsync(ct); continue; }
 
                     _logger.LogInformation("[{Repo}] analyzing", repo.Name);
-                    var (enhancements, raw) = await _analysis.RunAsync(repo.LocalPath, repo.Mission, ct);
+                    var (enhancements, raw) = await _analysis.RunAsync(repo.Name, repo.LocalPath, repo.Mission, ct);
                     try { await File.WriteAllTextAsync(_state.AnalysisPath(repo.Name), raw, ct); } catch { }
                     state.LastAnalyzedUtc = DateTime.UtcNow;
 
@@ -156,7 +171,7 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
                 if (enh is null) { await Task.Delay(TimeSpan.FromMinutes(5), ct); continue; }
 
                 _logger.LogInformation("[{Repo}] planning step for {Id} '{Title}'", repo.Name, enh.Id, enh.Title);
-                var plan = await _planner.PlanAsync(repo.LocalPath, enh, repo.Mission, ct);
+                var plan = await _planner.PlanAsync(repo.Name, repo.LocalPath, enh, repo.Mission, ct);
                 if (plan.IsComplete)
                 {
                     enh.Status = EnhancementStatus.Completed;

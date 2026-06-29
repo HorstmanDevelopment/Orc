@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Orc.Core.Claude;
 using Orc.Core.Configuration;
+using Orc.Core.Repos;
 
 namespace Orc.Core.Orchitect;
 
@@ -11,18 +12,22 @@ internal sealed class AnalysisRunner
     public const string OutputDirName = "claude_output";
     private const string PromptBody = $"You are an automated code development plan generator. Scan the code base in this directory and identify next steps for development. For each step, create a separate file in the `./{OutputDirName}/` directory with a short kebab-case name describing the step like `short-description-of-step.txt`. The content should be a few sentences describing a high level summary of the step. Examples of steps could be basic building blocks to get the app running, new features, new content etc. Each should be relevant to the mission statement. Respond with a list of files created. If you can't write files, describe why.";
     private readonly IClaudeClient _claude;
+    private readonly IRepoLock _repoLock;
     private readonly OrchitectOptions _options;
     private readonly ILogger<AnalysisRunner> _logger;
 
-    public AnalysisRunner(IClaudeClient claude, IOptions<OrchitectOptions> options, ILogger<AnalysisRunner> logger)
+    public AnalysisRunner(IClaudeClient claude, IRepoLock repoLock, IOptions<OrchitectOptions> options, ILogger<AnalysisRunner> logger)
     {
         _claude = claude;
+        _repoLock = repoLock;
         _options = options.Value;
         _logger = logger;
     }
 
-    public async Task<(IReadOnlyList<Enhancement> Enhancements, string Raw)> RunAsync(string repoPath, string? mission, CancellationToken ct)
+    public async Task<(IReadOnlyList<Enhancement> Enhancements, string Raw)> RunAsync(string repoName, string repoPath, string? mission, CancellationToken ct)
     {
+        await using var _ = await _repoLock.AcquireAsync(repoName, ct);
+
         var outDir = Path.Combine(repoPath, OutputDirName);
         ClaudeOutputDir.Reset(outDir);
 

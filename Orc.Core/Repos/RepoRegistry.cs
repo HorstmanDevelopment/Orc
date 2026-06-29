@@ -36,7 +36,8 @@ internal sealed class RepoRegistry : IRepoRegistry
                 r.Url ?? "",
                 string.IsNullOrWhiteSpace(r.Branch) ? "main" : r.Branch.Trim(),
                 Path.Combine(_layout.ReposDir, name),
-                string.IsNullOrWhiteSpace(r.Mission) ? null : r.Mission.Trim());
+                string.IsNullOrWhiteSpace(r.Mission) ? null : r.Mission.Trim(),
+                r.AutoMerge ?? true);
         }).ToArray();
     }
 
@@ -171,5 +172,10 @@ internal sealed class RepoRegistry : IRepoRegistry
         public string Branch { get; set; } = "main";
         public string? Name { get; set; }
         public string? Mission { get; set; }
+
+        // Null in legacy/hand-written repos.json means "use the default" (true):
+        // on success the orc-task branch is merged into the base branch and deleted.
+        // Set false to leave the branch un-merged for human review.
+        public bool? AutoMerge { get; set; }
     }
 }

@@ -6,6 +6,7 @@ public interface IOrchitectControl
     void Pause();
     void Resume();
     void ForceReanalyze(string repoName);
+    void ResetState(string repoName);
     QuotaSnapshot QuotaSnapshot();
     IReadOnlyList<string> ListRepos();
     RepoState LoadState(string repoName);

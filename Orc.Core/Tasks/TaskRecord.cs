@@ -24,7 +24,9 @@ public sealed record RepoResult(
     int ExitCode,
     bool HasChanges,
     string? Branch,
-    string? PerRepoLogPath);
+    string? PerRepoLogPath,
+    string? FailedStage = null,
+    string? FailReason = null);
 
 public sealed record TaskOutcome(
     bool AllOk,

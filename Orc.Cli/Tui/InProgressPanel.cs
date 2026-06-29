@@ -1,3 +1,4 @@
+using Orc.Cli.Forms;
 using Orc.Core.Tasks;
 using Spectre.Console;
 using Spectre.Console.Rendering;
@@ -19,23 +20,33 @@ public static class InProgressPanel
             .AddColumn("[yellow]Elapsed[/]");
 
         var now = DateTime.UtcNow;
+        var stuckCount = 0;
         foreach (var t in running.OrderBy(t => t.CreatedUtc))
         {
             var elapsed = now - t.CreatedUtc;
+            var isStuck = elapsed >= CancelRunningTaskForm.StuckThreshold;
+            if (isStuck) stuckCount++;
+
             var s = elapsed.TotalHours >= 1
                 ? $"{(int)elapsed.TotalHours}h{elapsed.Minutes:D2}m"
                 : $"{elapsed.Minutes:D2}m{elapsed.Seconds:D2}s";
+            var elapsedCell = isStuck ? $"[red]{s} [[STUCK]][/]" : $"[cyan]{s}[/]";
+
             table.AddRow(
                 Markup.Escape(t.Id),
                 Markup.Escape(t.Source.ToString()),
                 Markup.Escape(t.RepoSpec),
-                $"[cyan]{s}[/]");
+                elapsedCell);
         }
+
+        var headerTitle = stuckCount > 0
+            ? $"[bold yellow]In Progress ({running.Count})[/]  [red]{stuckCount} stuck[/]  [grey]· main menu → Cancel running task[/]"
+            : $"[bold yellow]In Progress ({running.Count})[/]";
 
         return new Panel(table)
             .Border(BoxBorder.Rounded)
-            .BorderColor(Color.Yellow)
-            .Header($"[bold yellow]In Progress ({running.Count})[/]", Justify.Left)
+            .BorderColor(stuckCount > 0 ? Color.Red : Color.Yellow)
+            .Header(headerTitle, Justify.Left)
             .Expand();
     }
 }

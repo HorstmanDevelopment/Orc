@@ -12,6 +12,7 @@ public interface IOrchitectStateStore
     string HistoryPath(string repoName);
     IReadOnlyList<string> ListRepos();
     void AppendHistory(string repoName, string message);
+    void Reset(string repoName);
 }
 
 internal sealed class OrchitectStateStore : IOrchitectStateStore
@@ -81,6 +82,15 @@ internal sealed class OrchitectStateStore : IOrchitectStateStore
             File.AppendAllText(path, $"{DateTime.UtcNow:O} {message}{Environment.NewLine}");
         }
         catch { }
+    }
+
+    public void Reset(string repoName)
+    {
+        var dir = RepoDir(repoName);
+        lock (_lock)
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
     }
 
     private string RepoDir(string repoName) => Path.Combine(_layout.OrchitectDir, "repos", repoName);

@@ -1,3 +1,9 @@
 namespace Orc.Core.Repos;
 
-public sealed record RepoEntry(string Name, string Url, string BaseBranch, string LocalPath, string? Mission = null);
+public sealed record RepoEntry(
+    string Name,
+    string Url,
+    string BaseBranch,
+    string LocalPath,
+    string? Mission = null,
+    bool AutoMerge = true);
