@@ -1,4 +1,6 @@
 using System.Reflection;
+using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Orc.Core.Configuration;
@@ -28,29 +30,50 @@ internal sealed class ClaudeClient : IClaudeClient
         string repoPath,
         string prompt,
         IReadOnlyList<string>? allowedTools,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? resumeSessionId = null,
+        Action<string>? onSessionId = null)
     {
         EnsureSettingsFile(repoPath);
         var tools = allowedTools ?? _options.DefaultAllowedTools;
-        var (exe, args) = BuildCommand(tools);
+        var (exe, args) = BuildCommand(tools, resumeSessionId);
+
+        // stream-json emits an init line carrying the session_id at the very start, so we
+        // can capture (and persist) it the instant it arrives — before any later kill.
+        var parser = new StreamJsonParser(id =>
+        {
+            if (id is { Length: > 0 }) onSessionId?.Invoke(id);
+        });
+
         // The prompt goes over stdin, not the command line: orchitect prompts routinely
         // exceed the Windows ~8KB command-line limit ("The command line is too long").
-        var pr = await _runner.RunAsync(exe, args, repoPath, _options.Timeout, ct, stdin: prompt);
+        var pr = await _runner.RunAsync(exe, args, repoPath, _options.Timeout, ct,
+            stdin: prompt, onStdoutLine: parser.Feed);
+
+        var text = parser.ResultText ?? pr.StdOut;
         _logger.LogInformation(
-            "Claude in {Repo} exit={Exit} stdOut={StdOut}B stdErr={StdErr}B",
-            repoPath, pr.ExitCode, pr.StdOut.Length, pr.StdErr.Length);
-        return new ClaudeRunResult(pr.ExitCode, pr.StdOut, pr.StdErr);
+            "Claude in {Repo} exit={Exit} session={Session} resume={Resume} out={Out}B err={Err}B",
+            repoPath, pr.ExitCode, parser.SessionId ?? "-", resumeSessionId ?? "-", text.Length, pr.StdErr.Length);
+        return new ClaudeRunResult(pr.ExitCode, text, pr.StdErr, parser.SessionId);
     }
 
-    private (string Exe, List<string> Args) BuildCommand(IReadOnlyList<string> tools)
+    private (string Exe, List<string> Args) BuildCommand(IReadOnlyList<string> tools, string? resumeSessionId)
     {
         // -p with no inline prompt makes claude read the prompt from stdin (see RunAsync).
+        // stream-json + --verbose is required for streamed JSON events in print mode.
         var claudeArgs = new List<string>
         {
             "-p",
+            "--output-format", "stream-json",
+            "--verbose",
             "--permission-mode", _options.PermissionMode,
             "--allowedTools", string.Join(" ", tools),
         };
+        if (resumeSessionId is { Length: > 0 })
+        {
+            claudeArgs.Add("--resume");
+            claudeArgs.Add(resumeSessionId);
+        }
 
         if (OperatingSystem.IsWindows() && !Path.IsPathRooted(_resolvedBinary))
         {
@@ -77,5 +100,68 @@ internal sealed class ClaudeClient : IClaudeClient
         using var s = asm.GetManifestResourceStream(name)!;
         using var sr = new StreamReader(s);
         return sr.ReadToEnd();
+    }
+
+    /// <summary>
+    /// Parses Claude's <c>--output-format stream-json</c> NDJSON stream line-by-line:
+    /// captures the session id (fired via callback the first time it's seen) and the
+    /// final result text. Falls back to accumulated assistant text when the run is
+    /// killed before the terminal <c>result</c> event. Tolerant of non-JSON lines.
+    /// Invoked sequentially from the process's stdout pump — no internal locking needed.
+    /// </summary>
+    private sealed class StreamJsonParser
+    {
+        private readonly Action<string?> _onSessionId;
+        private readonly StringBuilder _assistant = new();
+        private string? _resultText;
+
+        public StreamJsonParser(Action<string?> onSessionId) => _onSessionId = onSessionId;
+
+        public string? SessionId { get; private set; }
+        public string? ResultText =>
+            _resultText ?? (_assistant.Length > 0 ? _assistant.ToString() : null);
+
+        public void Feed(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return;
+            JsonDocument doc;
+            try { doc = JsonDocument.Parse(line); }
+            catch { return; }
+            using (doc)
+            {
+                var root = doc.RootElement;
+                if (root.ValueKind != JsonValueKind.Object) return;
+
+                if (SessionId is null &&
+                    root.TryGetProperty("session_id", out var sid) &&
+                    sid.ValueKind == JsonValueKind.String)
+                {
+                    SessionId = sid.GetString();
+                    _onSessionId(SessionId);
+                }
+
+                var type = root.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String
+                    ? t.GetString()
+                    : null;
+
+                if (type == "result" &&
+                    root.TryGetProperty("result", out var res) &&
+                    res.ValueKind == JsonValueKind.String)
+                {
+                    _resultText = res.GetString();
+                }
+                else if (type == "assistant" &&
+                         root.TryGetProperty("message", out var msg) &&
+                         msg.TryGetProperty("content", out var content) &&
+                         content.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var block in content.EnumerateArray())
+                    {
+                        if (block.TryGetProperty("text", out var txt) && txt.ValueKind == JsonValueKind.String)
+                            _assistant.AppendLine(txt.GetString());
+                    }
+                }
+            }
+        }
     }
 }

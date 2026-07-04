@@ -1,6 +1,8 @@
 using System.Text;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Orc.Core.Configuration;
 using Orc.Core.Pipeline;
 using Orc.Core.Repos;
 using Orc.Core.Tasks;
@@ -15,6 +17,7 @@ internal sealed class OrchestratorService : BackgroundService
     private readonly IRepoRegistry _repos;
     private readonly IGitClient _git;
     private readonly IRepoLock _repoLock;
+    private readonly ResumeOptions _resume;
     private readonly ILogger<OrchestratorService> _logger;
 
     public OrchestratorService(
@@ -24,6 +27,7 @@ internal sealed class OrchestratorService : BackgroundService
         IRepoRegistry repos,
         IGitClient git,
         IRepoLock repoLock,
+        IOptions<ResumeOptions> resume,
         ILogger<OrchestratorService> logger)
     {
         _store = store;
@@ -32,6 +36,7 @@ internal sealed class OrchestratorService : BackgroundService
         _repos = repos;
         _git = git;
         _repoLock = repoLock;
+        _resume = resume.Value;
         _logger = logger;
     }
 
@@ -39,6 +44,7 @@ internal sealed class OrchestratorService : BackgroundService
     {
         _logger.LogInformation("Orchestrator started");
         await ReconcileOrphansAsync(hostCt);
+        await AutoResumeAsync(hostCt);
         while (!hostCt.IsCancellationRequested)
         {
             TaskRecord? task = null;
@@ -57,7 +63,9 @@ internal sealed class OrchestratorService : BackgroundService
             _registry.Register(task.Id, perTaskCts);
             try
             {
-                var outcome = await _runner.RunAsync(task, perTaskCts.Token);
+                // A resumed task carries a checkpoint; a fresh one returns null here.
+                var checkpoint = await _store.GetCheckpointAsync(task.Id, hostCt);
+                var outcome = await _runner.RunAsync(task, perTaskCts.Token, checkpoint);
                 await _store.CompleteAsync(task.Id, outcome, hostCt);
             }
             catch (OperationCanceledException) when (!hostCt.IsCancellationRequested)
@@ -79,10 +87,10 @@ internal sealed class OrchestratorService : BackgroundService
         _logger.LogInformation("Orchestrator stopped");
     }
 
-    // Any task sitting in running/ at startup is an orphan: the process that owned it
-    // is gone, so the in-memory registry has no CancellationTokenSource for it and it
-    // would otherwise display as "Running" forever and refuse to cancel. Restore each
-    // repo and move the task to failed/ so the workspace returns to a clean state.
+    // Any task sitting in running/ at startup is an orphan: the process that owned it is
+    // gone, so the in-memory registry has no CancellationTokenSource for it. A task with
+    // meaningful progress (a captured Claude session, or a created branch) is preserved as
+    // Interrupted for resume; anything else is wiped clean and moved to failed/.
     private async Task ReconcileOrphansAsync(CancellationToken hostCt)
     {
         IReadOnlyList<TaskHeader> orphans;
@@ -95,9 +103,52 @@ internal sealed class OrchestratorService : BackgroundService
         foreach (var o in orphans)
         {
             if (hostCt.IsCancellationRequested) return;
-            await CancelAndCleanupAsync(o.Id, o.RepoSpec, "orphaned by restart");
+
+            var cp = await _store.GetCheckpointAsync(o.Id, hostCt);
+            if (IsResumable(cp))
+            {
+                await _store.MarkInterruptedAsync(o.Id, "interrupted (process exited mid-run)", hostCt);
+                _logger.LogInformation("Task {Id} preserved as interrupted for resume", o.Id);
+            }
+            else
+            {
+                await CancelAndCleanupAsync(o.Id, o.RepoSpec, "orphaned by restart");
+            }
         }
     }
+
+    // Re-queue interrupted tasks (under the attempt cap) so the claim loop resumes them.
+    private async Task AutoResumeAsync(CancellationToken hostCt)
+    {
+        if (!_resume.AutoResume) return;
+
+        IReadOnlyList<TaskHeader> interrupted;
+        try { interrupted = await _store.ListAsync(TaskState.Interrupted, hostCt); }
+        catch (Exception ex) { _logger.LogError(ex, "auto-resume: list failed"); return; }
+
+        foreach (var t in interrupted)
+        {
+            if (hostCt.IsCancellationRequested) return;
+
+            var cp = await _store.GetCheckpointAsync(t.Id, hostCt);
+            var attempts = cp?.ResumeAttempts ?? 0;
+            if (attempts >= _resume.MaxAttempts)
+            {
+                _logger.LogWarning("Task {Id} hit resume cap ({Max}); left for manual handling", t.Id, _resume.MaxAttempts);
+                continue;
+            }
+
+            if (cp is not null)
+                await _store.SaveCheckpointAsync(t.Id, cp with { ResumeAttempts = attempts + 1 }, hostCt);
+            await _store.RequeueInterruptedAsync(t.Id, hostCt);
+            _logger.LogInformation("Auto-resuming task {Id} (attempt {N})", t.Id, attempts + 1);
+        }
+    }
+
+    private static bool IsResumable(TaskCheckpoint? cp) =>
+        cp is not null && cp.Repos.Any(r =>
+            r.ClaudeSessionId is not null ||
+            r.LastCompletedStage is "CreateBranch" or "RunClaude" or "Commit");
 
     private async Task CancelAndCleanupAsync(string taskId, string repoSpec, string reason)
     {

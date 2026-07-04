@@ -78,7 +78,7 @@ internal sealed class GitClient : IGitClient
         return new GitOpResult(true, buf.ToString());
     }
 
-    public async Task<GitUnmergedResult> FindUnmergedBranchesAsync(RepoEntry repo, string branchPrefix, CancellationToken ct)
+    public async Task<GitUnmergedResult> FindUnmergedBranchesAsync(RepoEntry repo, string branchPrefix, CancellationToken ct, string? excludeBranch = null)
     {
         if (!Directory.Exists(Path.Combine(repo.LocalPath, ".git")))
             return new GitUnmergedResult(false, [], $"Not a git repo: {repo.LocalPath}");
@@ -90,6 +90,8 @@ internal sealed class GitClient : IGitClient
         var branches = pr.StdOut.Split('\n', StringSplitOptions.RemoveEmptyEntries)
             .Select(l => l.TrimStart('*', ' ').Trim())
             .Where(l => l.Length > 0 && l.Contains(branchPrefix, StringComparison.OrdinalIgnoreCase))
+            // On resume the task's own preserved branch is (legitimately) un-merged; don't self-block.
+            .Where(l => excludeBranch is null || !string.Equals(l, excludeBranch, StringComparison.Ordinal))
             .ToArray();
 
         return new GitUnmergedResult(true, branches, pr.Combined);
@@ -100,8 +102,15 @@ internal sealed class GitClient : IGitClient
         if (!Directory.Exists(Path.Combine(repo.LocalPath, ".git")))
             return new GitOpResult(false, $"Not a git repo: {repo.LocalPath}");
 
-        var pr = await _runner.RunAsync("git",
-            ["checkout", "-b", branchName, repo.BaseBranch], repo.LocalPath, null, ct);
+        // Idempotent: if the branch already exists (e.g. resuming an interrupted task),
+        // check it out instead of failing on `checkout -b`.
+        var exists = await _runner.RunAsync("git",
+            ["rev-parse", "--verify", "--quiet", $"refs/heads/{branchName}"], repo.LocalPath, null, ct);
+        var checkoutArgs = exists.Success
+            ? new[] { "checkout", branchName }
+            : ["checkout", "-b", branchName, repo.BaseBranch];
+
+        var pr = await _runner.RunAsync("git", checkoutArgs, repo.LocalPath, null, ct);
         return new GitOpResult(pr.Success, pr.Combined);
     }
 

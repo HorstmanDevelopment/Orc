@@ -10,5 +10,20 @@ public interface ITaskStore
     Task<TaskHeader?> GetAsync(string id, CancellationToken ct);
     Task<int> PurgeAsync(TaskState state, CancellationToken ct);
 
+    /// <summary>Write/replace the resume checkpoint on the (running) task doc in place.</summary>
+    Task SaveCheckpointAsync(string id, TaskCheckpoint checkpoint, CancellationToken ct);
+
+    /// <summary>Read the resume checkpoint for a task, if any.</summary>
+    Task<TaskCheckpoint?> GetCheckpointAsync(string id, CancellationToken ct);
+
+    /// <summary>Move a running task to interrupted/ (checkpoint preserved) for later resume.</summary>
+    Task<bool> MarkInterruptedAsync(string id, string note, CancellationToken ct);
+
+    /// <summary>Move an interrupted task back to pending/ so the orchestrator re-claims it.</summary>
+    Task<bool> RequeueInterruptedAsync(string id, CancellationToken ct);
+
+    /// <summary>Move an interrupted task to failed/ (e.g. user discarded it).</summary>
+    Task<bool> FailInterruptedAsync(string id, string reason, CancellationToken ct);
+
     event Action<TaskHeader>? StateChanged;
 }

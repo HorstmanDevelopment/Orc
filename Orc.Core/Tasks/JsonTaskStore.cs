@@ -17,6 +17,7 @@ internal sealed class JsonTaskStore : ITaskStore
     private readonly WorkspaceLayout _layout;
     private readonly ILogger<JsonTaskStore> _logger;
     private readonly object _claimLock = new();
+    private readonly SemaphoreSlim _checkpointLock = new(1, 1);
 
     public event Action<TaskHeader>? StateChanged;
 
@@ -68,7 +69,8 @@ internal sealed class JsonTaskStore : ITaskStore
         }
 
         var running = doc!.Header with { State = TaskState.Running };
-        var updated = new StoredTask(running, doc.Prompt);
+        // Preserve the checkpoint so a requeued (resumed) task keeps its progress.
+        var updated = new StoredTask(running, doc.Prompt, doc.Checkpoint);
         await WriteAtomicAsync(dest!, updated, ct);
         StateChanged?.Invoke(running);
         return new TaskRecord(running.Id, running.Source, running.RepoSpec, doc.Prompt, running.CreatedUtc);
@@ -156,6 +158,92 @@ internal sealed class JsonTaskStore : ITaskStore
         return Task.FromResult(n);
     }
 
+    public async Task SaveCheckpointAsync(string id, TaskCheckpoint checkpoint, CancellationToken ct)
+    {
+        await _checkpointLock.WaitAsync(ct);
+        try
+        {
+            if (!TryFindDoc(id, out var state, out var path, out var doc) || doc is null)
+            {
+                _logger.LogWarning("save checkpoint: task {Id} not found", id);
+                return;
+            }
+            await WriteAtomicAsync(path, doc with { Checkpoint = checkpoint }, ct);
+        }
+        finally { _checkpointLock.Release(); }
+    }
+
+    public Task<TaskCheckpoint?> GetCheckpointAsync(string id, CancellationToken ct)
+    {
+        TryFindDoc(id, out _, out _, out var doc);
+        return Task.FromResult(doc?.Checkpoint);
+    }
+
+    public Task<bool> MarkInterruptedAsync(string id, string note, CancellationToken ct) =>
+        MoveAsync(id, TaskState.Running, TaskState.Interrupted, h => h with
+        {
+            State = TaskState.Interrupted,
+            CompletedUtc = DateTime.UtcNow,
+            Outcome = new TaskOutcome(false, h.Outcome?.HasAnyChanges ?? false, h.Outcome?.PerRepo ?? [], note),
+        }, ct);
+
+    public Task<bool> RequeueInterruptedAsync(string id, CancellationToken ct) =>
+        MoveAsync(id, TaskState.Interrupted, TaskState.Pending, h => h with
+        {
+            State = TaskState.Pending,
+            CompletedUtc = null,
+            Outcome = null,
+        }, ct);
+
+    public Task<bool> FailInterruptedAsync(string id, string reason, CancellationToken ct) =>
+        MoveAsync(id, TaskState.Interrupted, TaskState.Failed, h => h with
+        {
+            State = TaskState.Failed,
+            CompletedUtc = DateTime.UtcNow,
+            Outcome = new TaskOutcome(false, false, h.Outcome?.PerRepo ?? [], reason),
+        }, ct);
+
+    private async Task<bool> MoveAsync(string id, TaskState from, TaskState to, Func<TaskHeader, TaskHeader> mutate, CancellationToken ct)
+    {
+        await _checkpointLock.WaitAsync(ct);
+        try
+        {
+            var src = PathFor(from, id);
+            if (!File.Exists(src)) { _logger.LogWarning("move {Id}: not in {From}", id, from); return false; }
+            var doc = ReadDoc(src);
+            if (doc is null) return false;
+
+            var newDoc = doc with { Header = mutate(doc.Header) };
+            var dest = PathFor(to, id);
+            await WriteAtomicAsync(dest, newDoc, ct);
+            try { if (!string.Equals(src, dest, StringComparison.OrdinalIgnoreCase)) File.Delete(src); } catch { }
+
+            _logger.LogInformation("Task {Id} {From} -> {To}", id, from, to);
+            StateChanged?.Invoke(newDoc.Header);
+            return true;
+        }
+        finally { _checkpointLock.Release(); }
+    }
+
+    private bool TryFindDoc(string id, out TaskState state, out string path, out StoredTask? doc)
+    {
+        foreach (var s in Enum.GetValues<TaskState>())
+        {
+            var p = PathFor(s, id);
+            if (File.Exists(p))
+            {
+                state = s;
+                path = p;
+                doc = ReadDoc(p);
+                return doc is not null;
+            }
+        }
+        state = default;
+        path = "";
+        doc = null;
+        return false;
+    }
+
     private string DirFor(TaskState s) => Path.Combine(_layout.TasksDir, s.ToString().ToLowerInvariant());
     private string PathFor(TaskState s, string id) => Path.Combine(DirFor(s), $"{id}.json");
 
@@ -184,5 +272,5 @@ internal sealed class JsonTaskStore : ITaskStore
         File.Move(tmp, path);
     }
 
-    private sealed record StoredTask(TaskHeader Header, string Prompt);
+    private sealed record StoredTask(TaskHeader Header, string Prompt, TaskCheckpoint? Checkpoint = null);
 }

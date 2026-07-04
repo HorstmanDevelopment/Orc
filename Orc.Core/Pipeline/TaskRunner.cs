@@ -7,13 +7,14 @@ namespace Orc.Core.Pipeline;
 
 public interface ITaskRunner
 {
-    Task<TaskOutcome> RunAsync(TaskRecord task, CancellationToken ct);
+    Task<TaskOutcome> RunAsync(TaskRecord task, CancellationToken ct, TaskCheckpoint? checkpoint = null);
 }
 
 internal sealed class TaskRunner : ITaskRunner
 {
     private readonly IRepoRegistry _repos;
     private readonly IRepoLock _repoLock;
+    private readonly ITaskStore _store;
     private readonly IReadOnlyList<IStage> _stages;
     private readonly WorkspaceLayout _layout;
     private readonly ILogger<TaskRunner> _logger;
@@ -21,6 +22,7 @@ internal sealed class TaskRunner : ITaskRunner
     public TaskRunner(
         IRepoRegistry repos,
         IRepoLock repoLock,
+        ITaskStore store,
         RefreshRepoStage refresh,
         GuardUnmergedBranchStage guard,
         CreateBranchStage branch,
@@ -32,27 +34,44 @@ internal sealed class TaskRunner : ITaskRunner
     {
         _repos = repos;
         _repoLock = repoLock;
+        _store = store;
         _stages = [refresh, guard, branch, claude, commit, merge];
         _layout = layout;
         _logger = logger;
     }
 
-    public async Task<TaskOutcome> RunAsync(TaskRecord task, CancellationToken ct)
+    public async Task<TaskOutcome> RunAsync(TaskRecord task, CancellationToken ct, TaskCheckpoint? checkpoint = null)
     {
         using var scope = _logger.BeginScope(new Dictionary<string, object?> { ["TaskId"] = task.Id });
 
         if (!_repos.TryResolve(task.RepoSpec, out var repos, out var err))
             return new TaskOutcome(false, false, [], err);
 
-        var stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-        var branchName = $"{GuardUnmergedBranchStage.BranchPrefix}/{task.Id}-{stamp}";
+        if (checkpoint is not null)
+            _logger.LogInformation("Resuming task {Id} (attempt {N})", task.Id, checkpoint.ResumeAttempts);
 
-        var perRepo = await Task.WhenAll(repos.Select(r => RunRepoAsync(task, r, branchName, stamp, ct)));
+        var stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var freshBranch = $"{GuardUnmergedBranchStage.BranchPrefix}/{task.Id}-{stamp}";
+        var progress = new CheckpointWriter(_store, task.Id, checkpoint?.ResumeAttempts ?? 0);
+
+        var perRepo = await Task.WhenAll(repos.Select(r =>
+            RunRepoAsync(task, r, freshBranch, stamp, ResumeFor(checkpoint, r.Name), progress, ct)));
 
         var allOk = perRepo.All(r => r.ExitCode == 0);
         var anyChanges = perRepo.Any(r => r.HasChanges);
         var reason = allOk ? null : SummarizeFailures(perRepo);
         return new TaskOutcome(allOk, anyChanges, perRepo, reason);
+    }
+
+    private static RepoCheckpoint? ResumeFor(TaskCheckpoint? cp, string repoName) =>
+        cp?.Repos.FirstOrDefault(r => string.Equals(r.RepoName, repoName, StringComparison.Ordinal));
+
+    private int StageIndexAfter(string? completedStage)
+    {
+        if (string.IsNullOrEmpty(completedStage)) return 0;
+        for (var i = 0; i < _stages.Count; i++)
+            if (_stages[i].Name == completedStage) return i + 1;
+        return 0;
     }
 
     private static string SummarizeFailures(IReadOnlyList<RepoResult> perRepo)
@@ -68,25 +87,38 @@ internal sealed class TaskRunner : ITaskRunner
         }));
     }
 
-    private async Task<RepoResult> RunRepoAsync(TaskRecord task, RepoEntry repo, string branchName, string stamp, CancellationToken ct)
+    private async Task<RepoResult> RunRepoAsync(
+        TaskRecord task, RepoEntry repo, string freshBranch, string freshStamp,
+        RepoCheckpoint? resume, CheckpointWriter progress, CancellationToken ct)
     {
         await using var _ = await _repoLock.AcquireAsync(repo.Name, ct);
 
+        var branchName = resume?.BranchName ?? freshBranch;
+        var stamp = resume?.Stamp ?? freshStamp;
         var ctx = new PipelineContext
         {
             Task = task,
             Repo = repo,
             BranchName = branchName,
             Stamp = stamp,
+            IsResuming = resume is not null,
+            ResumeSessionId = resume?.ClaudeSessionId,
+            HasChanges = resume?.HasChanges ?? false,
+            ClaudeSessionId = resume?.ClaudeSessionId,
         };
         var exit = 0;
         string? failedStage = null;
         string? failReason = null;
+        var lastCompleted = resume?.LastCompletedStage;
+        var startIndex = StageIndexAfter(lastCompleted);
+        if (startIndex > 0)
+            ctx.Transcript.AppendLine($"--- resuming {repo.Name} after stage '{lastCompleted}' (skipping {startIndex}) ---");
 
         try
         {
-            foreach (var stage in _stages)
+            for (var i = startIndex; i < _stages.Count; i++)
             {
+                var stage = _stages[i];
                 try
                 {
                     var r = await stage.ExecuteAsync(ctx, ct);
@@ -98,6 +130,7 @@ internal sealed class TaskRunner : ITaskRunner
                         failReason = r.Reason ?? $"stage {stage.Name} aborted";
                         break;
                     }
+                    lastCompleted = stage.Name;
                     if (r.StopPipeline) break;
                 }
                 catch (OperationCanceledException) { throw; }
@@ -117,7 +150,12 @@ internal sealed class TaskRunner : ITaskRunner
         }
         finally
         {
-            ctx.PerRepoLogPath = await PersistTranscriptAsync(task, repo, ctx, ct);
+            // Persist progress (incl. any captured Claude session id) with an untainted
+            // token so a shutdown-driven cancel still records enough to resume later.
+            await progress.UpdateAsync(
+                new RepoCheckpoint(repo.Name, branchName, stamp, lastCompleted, ctx.ClaudeSessionId, ctx.HasChanges),
+                CancellationToken.None);
+            ctx.PerRepoLogPath = await PersistTranscriptAsync(task, repo, ctx, CancellationToken.None);
         }
 
         return new RepoResult(repo.Name, exit, ctx.HasChanges, branchName, ctx.PerRepoLogPath, failedStage, failReason);
@@ -130,5 +168,32 @@ internal sealed class TaskRunner : ITaskRunner
         var path = Path.Combine(dir, $"{repo.Name}.log");
         await File.WriteAllTextAsync(path, ctx.Transcript.ToString(), ct);
         return path;
+    }
+
+    /// <summary>
+    /// Accumulates per-repo checkpoints for one task run and flushes the merged
+    /// <see cref="TaskCheckpoint"/> to the store. The store serializes the actual writes,
+    /// so concurrent repos can update safely.
+    /// </summary>
+    private sealed class CheckpointWriter
+    {
+        private readonly ITaskStore _store;
+        private readonly string _taskId;
+        private readonly int _attempts;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, RepoCheckpoint> _repos = new(StringComparer.Ordinal);
+
+        public CheckpointWriter(ITaskStore store, string taskId, int attempts)
+        {
+            _store = store;
+            _taskId = taskId;
+            _attempts = attempts;
+        }
+
+        public Task UpdateAsync(RepoCheckpoint repo, CancellationToken ct)
+        {
+            _repos[repo.RepoName] = repo;
+            var snapshot = new TaskCheckpoint(_attempts, _repos.Values.ToArray());
+            return _store.SaveCheckpointAsync(_taskId, snapshot, ct);
+        }
     }
 }

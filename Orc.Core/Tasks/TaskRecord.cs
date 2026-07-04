@@ -1,6 +1,24 @@
 namespace Orc.Core.Tasks;
 
-public enum TaskState { Pending, Running, Succeeded, Failed }
+public enum TaskState { Pending, Running, Succeeded, Failed, Interrupted }
+
+/// <summary>
+/// Per-repo progress recorded as a task runs, so an interrupted task can be resumed
+/// on the same branch (and, when available, the same Claude session) instead of
+/// restarting from scratch. <see cref="LastCompletedStage"/> is the highest stage that
+/// finished; resume re-runs from the next one.
+/// </summary>
+public sealed record RepoCheckpoint(
+    string RepoName,
+    string BranchName,
+    string Stamp,
+    string? LastCompletedStage,
+    string? ClaudeSessionId,
+    bool HasChanges);
+
+public sealed record TaskCheckpoint(
+    int ResumeAttempts,
+    IReadOnlyList<RepoCheckpoint> Repos);
 
 public sealed record TaskSource(string Kind, string? Details = null)
 {

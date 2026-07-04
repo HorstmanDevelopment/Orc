@@ -115,4 +115,80 @@ public class JsonTaskStoreTests
         Assert.Equal(2, n);
         Assert.Empty(await store.ListAsync(TaskState.Pending, CancellationToken.None));
     }
+
+    private static TaskCheckpoint Checkpoint(int attempts = 0, string? stage = "RunClaude", string? session = "sess-1") =>
+        new(attempts, [new RepoCheckpoint("foo", "orc-task/foo-x", "stamp", stage, session, true)]);
+
+    [Fact]
+    public async Task SaveCheckpoint_then_GetCheckpoint_roundtrips()
+    {
+        using var ws = new TempWorkspace();
+        var store = Build(ws);
+        await store.EnqueueAsync(NewRecord(), CancellationToken.None);
+        var claimed = await store.ClaimNextAsync(CancellationToken.None);
+
+        await store.SaveCheckpointAsync(claimed!.Id, Checkpoint(attempts: 1), CancellationToken.None);
+
+        var cp = await store.GetCheckpointAsync(claimed.Id, CancellationToken.None);
+        Assert.NotNull(cp);
+        Assert.Equal(1, cp!.ResumeAttempts);
+        Assert.Equal("sess-1", cp.Repos.Single().ClaudeSessionId);
+        Assert.Equal("RunClaude", cp.Repos.Single().LastCompletedStage);
+    }
+
+    [Fact]
+    public async Task MarkInterrupted_moves_running_and_preserves_checkpoint()
+    {
+        using var ws = new TempWorkspace();
+        var store = Build(ws);
+        await store.EnqueueAsync(NewRecord(), CancellationToken.None);
+        var claimed = await store.ClaimNextAsync(CancellationToken.None);
+        await store.SaveCheckpointAsync(claimed!.Id, Checkpoint(), CancellationToken.None);
+
+        Assert.True(await store.MarkInterruptedAsync(claimed.Id, "interrupted", CancellationToken.None));
+
+        Assert.Empty(await store.ListAsync(TaskState.Running, CancellationToken.None));
+        var interrupted = await store.ListAsync(TaskState.Interrupted, CancellationToken.None);
+        Assert.Single(interrupted);
+        Assert.Equal("interrupted", interrupted[0].Outcome!.Reason);
+        // Checkpoint survives the move so resume can use it.
+        var cp = await store.GetCheckpointAsync(claimed.Id, CancellationToken.None);
+        Assert.Equal("sess-1", cp!.Repos.Single().ClaudeSessionId);
+    }
+
+    [Fact]
+    public async Task Requeue_interrupted_returns_to_pending_with_checkpoint()
+    {
+        using var ws = new TempWorkspace();
+        var store = Build(ws);
+        await store.EnqueueAsync(NewRecord(), CancellationToken.None);
+        var claimed = await store.ClaimNextAsync(CancellationToken.None);
+        await store.SaveCheckpointAsync(claimed!.Id, Checkpoint(attempts: 1), CancellationToken.None);
+        await store.MarkInterruptedAsync(claimed.Id, "interrupted", CancellationToken.None);
+
+        Assert.True(await store.RequeueInterruptedAsync(claimed.Id, CancellationToken.None));
+        Assert.Empty(await store.ListAsync(TaskState.Interrupted, CancellationToken.None));
+        Assert.Single(await store.ListAsync(TaskState.Pending, CancellationToken.None));
+
+        // Re-claiming keeps the checkpoint, so the runner resumes rather than restarts.
+        var reclaimed = await store.ClaimNextAsync(CancellationToken.None);
+        var cp = await store.GetCheckpointAsync(reclaimed!.Id, CancellationToken.None);
+        Assert.Equal(1, cp!.ResumeAttempts);
+    }
+
+    [Fact]
+    public async Task FailInterrupted_moves_to_failed()
+    {
+        using var ws = new TempWorkspace();
+        var store = Build(ws);
+        await store.EnqueueAsync(NewRecord(), CancellationToken.None);
+        var claimed = await store.ClaimNextAsync(CancellationToken.None);
+        await store.SaveCheckpointAsync(claimed!.Id, Checkpoint(), CancellationToken.None);
+        await store.MarkInterruptedAsync(claimed.Id, "interrupted", CancellationToken.None);
+
+        Assert.True(await store.FailInterruptedAsync(claimed.Id, "discarded", CancellationToken.None));
+        var failed = await store.ListAsync(TaskState.Failed, CancellationToken.None);
+        Assert.Single(failed);
+        Assert.Equal("discarded", failed[0].Outcome!.Reason);
+    }
 }

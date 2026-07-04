@@ -8,5 +8,6 @@ public interface IProcessRunner
         string workingDir,
         TimeSpan? timeout,
         CancellationToken ct,
-        string? stdin = null);
+        string? stdin = null,
+        Action<string>? onStdoutLine = null);
 }

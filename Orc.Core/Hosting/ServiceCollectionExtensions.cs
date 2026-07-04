@@ -17,6 +17,7 @@ public static class ServiceCollectionExtensions
         services.Configure<WorkspaceOptions>(config.GetSection(WorkspaceOptions.Section));
         services.Configure<ClaudeOptions>(config.GetSection(ClaudeOptions.Section));
         services.Configure<OrchitectOptions>(config.GetSection(OrchitectOptions.Section));
+        services.Configure<ResumeOptions>(config.GetSection(ResumeOptions.Section));
 
         services.AddSingleton<WorkspaceLayout>();
         services.AddSingleton<IProcessRunner, ProcessRunner>();
@@ -26,6 +27,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IRepoLock, RepoLock>();
         services.AddSingleton<ITaskStore, JsonTaskStore>();
         services.AddSingleton<IRunningTaskRegistry, RunningTaskRegistry>();
+        services.AddSingleton<ITaskResumer, TaskResumeService>();
 
         services.AddSingleton<RefreshRepoStage>();
         services.AddSingleton<GuardUnmergedBranchStage>();

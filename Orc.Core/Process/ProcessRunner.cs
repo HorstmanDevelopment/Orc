@@ -16,7 +16,8 @@ internal sealed class ProcessRunner : IProcessRunner
         string workingDir,
         TimeSpan? timeout,
         CancellationToken ct,
-        string? stdin = null)
+        string? stdin = null,
+        Action<string>? onStdoutLine = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -33,7 +34,14 @@ internal sealed class ProcessRunner : IProcessRunner
         using var proc = new System.Diagnostics.Process { StartInfo = psi };
         var stdOut = new StringBuilder();
         var stdErr = new StringBuilder();
-        proc.OutputDataReceived += (_, e) => { if (e.Data != null) stdOut.AppendLine(e.Data); };
+        proc.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data == null) return;
+            stdOut.AppendLine(e.Data);
+            // Live line callback: lets callers capture streamed data (e.g. a Claude
+            // session id) the instant it arrives, so it survives a later kill.
+            try { onStdoutLine?.Invoke(e.Data); } catch { }
+        };
         proc.ErrorDataReceived += (_, e) => { if (e.Data != null) stdErr.AppendLine(e.Data); };
 
         _logger.LogDebug("Run {File} {Args} (cwd={Cwd})", fileName, string.Join(' ', args), workingDir);

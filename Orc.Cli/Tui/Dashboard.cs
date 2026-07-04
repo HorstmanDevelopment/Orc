@@ -15,6 +15,7 @@ public sealed class Dashboard
     private readonly IGitClient _git;
     private readonly WorkspaceLayout _layout;
     private readonly IRunningTaskRegistry _runningTasks;
+    private readonly ITaskResumer _resumer;
 
     public Dashboard(
         ITaskStore tasks,
@@ -22,7 +23,8 @@ public sealed class Dashboard
         IOrchitectControl orchitect,
         IGitClient git,
         WorkspaceLayout layout,
-        IRunningTaskRegistry runningTasks)
+        IRunningTaskRegistry runningTasks,
+        ITaskResumer resumer)
     {
         _tasks = tasks;
         _registry = registry;
@@ -30,6 +32,7 @@ public sealed class Dashboard
         _git = git;
         _layout = layout;
         _runningTasks = runningTasks;
+        _resumer = resumer;
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -88,6 +91,7 @@ public sealed class Dashboard
                     "Edit repo mission",
                     "View task history",
                     "View failures",
+                    "Resume interrupted tasks",
                     "View installed repos",
                     pauseLabel,
                     "Reset Orchitect state for repo",
@@ -114,6 +118,9 @@ public sealed class Dashboard
                     break;
                 case "View failures":
                     await new FailuresForm(_tasks).RunAsync(ct);
+                    break;
+                case "Resume interrupted tasks":
+                    await new InterruptedTasksForm(_tasks, _resumer).RunAsync(ct);
                     break;
                 case "View installed repos":
                     RunPage(() => new RepoListForm(_registry).Run());
