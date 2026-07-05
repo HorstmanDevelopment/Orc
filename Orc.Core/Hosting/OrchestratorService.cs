@@ -18,7 +18,14 @@ internal sealed class OrchestratorService : BackgroundService
     private readonly IGitClient _git;
     private readonly IRepoLock _repoLock;
     private readonly ResumeOptions _resume;
+    private readonly OrchestratorOptions _options;
     private readonly ILogger<OrchestratorService> _logger;
+
+    // Serialization within a repo: a repo whose name is here has a task in flight, so no
+    // other task targeting it may be claimed. Guarded by _gate along with _inFlight.
+    private readonly object _gate = new();
+    private readonly HashSet<string> _busyRepos = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Task> _inFlight = new(StringComparer.Ordinal);
 
     public OrchestratorService(
         ITaskStore store,
@@ -28,6 +35,7 @@ internal sealed class OrchestratorService : BackgroundService
         IGitClient git,
         IRepoLock repoLock,
         IOptions<ResumeOptions> resume,
+        IOptions<OrchestratorOptions> options,
         ILogger<OrchestratorService> logger)
     {
         _store = store;
@@ -37,6 +45,7 @@ internal sealed class OrchestratorService : BackgroundService
         _git = git;
         _repoLock = repoLock;
         _resume = resume.Value;
+        _options = options.Value;
         _logger = logger;
     }
 
@@ -45,46 +54,107 @@ internal sealed class OrchestratorService : BackgroundService
         _logger.LogInformation("Orchestrator started");
         await ReconcileOrphansAsync(hostCt);
         await AutoResumeAsync(hostCt);
+
         while (!hostCt.IsCancellationRequested)
         {
-            TaskRecord? task = null;
-            try { task = await _store.ClaimNextAsync(hostCt); }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex) { _logger.LogError(ex, "claim failed"); }
+            // Fill every free slot with a claimable task. Claiming skips any task whose
+            // repos are already busy, so distinct repos run in parallel while a single repo
+            // never runs two tasks at once.
+            var launchedAny = false;
+            while (HasFreeSlot())
+            {
+                TaskRecord? task;
+                try { task = await _store.ClaimNextAsync(CanClaim, hostCt); }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex) { _logger.LogError(ex, "claim failed"); break; }
 
-            if (task is null)
+                if (task is null) break; // nothing claimable right now
+
+                var repoNames = ReposFor(task.RepoSpec);
+                lock (_gate)
+                {
+                    foreach (var r in repoNames) _busyRepos.Add(r);
+                }
+                // RunTaskAsync is async: it suspends at its first await and returns here
+                // before its finally (which frees the repos) can run, so registering it in
+                // _inFlight now cannot race the removal.
+                var run = RunTaskAsync(task, repoNames, hostCt);
+                lock (_gate) { _inFlight[task.Id] = run; }
+                launchedAny = true;
+            }
+
+            if (hostCt.IsCancellationRequested) break;
+            if (!launchedAny)
             {
                 try { await Task.Delay(TimeSpan.FromMilliseconds(500), hostCt); }
                 catch (OperationCanceledException) { break; }
-                continue;
-            }
-
-            using var perTaskCts = CancellationTokenSource.CreateLinkedTokenSource(hostCt);
-            _registry.Register(task.Id, perTaskCts);
-            try
-            {
-                // A resumed task carries a checkpoint; a fresh one returns null here.
-                var checkpoint = await _store.GetCheckpointAsync(task.Id, hostCt);
-                var outcome = await _runner.RunAsync(task, perTaskCts.Token, checkpoint);
-                await _store.CompleteAsync(task.Id, outcome, hostCt);
-            }
-            catch (OperationCanceledException) when (!hostCt.IsCancellationRequested)
-            {
-                _logger.LogWarning("Task {Id} cancelled by user", task.Id);
-                await CancelAndCleanupAsync(task.Id, task.RepoSpec, "cancelled by user");
-            }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Task {Id} threw", task.Id);
-                try { await _store.FailAsync(task.Id, ex.ToString(), CancellationToken.None); } catch { }
-            }
-            finally
-            {
-                _registry.Unregister(task.Id);
             }
         }
+
+        // Let in-flight runs finish their cleanup/checkpointing before the host stops.
+        Task[] draining;
+        lock (_gate) draining = _inFlight.Values.ToArray();
+        if (draining.Length > 0)
+        {
+            try { await Task.WhenAll(draining); } catch { /* per-task failures already handled */ }
+        }
         _logger.LogInformation("Orchestrator stopped");
+    }
+
+    private bool HasFreeSlot()
+    {
+        var max = _options.MaxConcurrentTasks;
+        if (max <= 0) return true; // no extra cap; one-per-repo bounds it naturally
+        lock (_gate) return _inFlight.Count < max;
+    }
+
+    // Predicate handed to the store: a task is claimable only if none of its repos are busy.
+    private bool CanClaim(string repoSpec)
+    {
+        var names = ReposFor(repoSpec);
+        if (names.Count == 0) return true; // unresolvable spec: claim so the runner fails it cleanly
+        lock (_gate) return !names.Any(_busyRepos.Contains);
+    }
+
+    private IReadOnlyList<string> ReposFor(string repoSpec) =>
+        _repos.TryResolve(repoSpec, out var repos, out _)
+            ? repos.Select(r => r.Name).ToArray()
+            : [];
+
+    private async Task RunTaskAsync(TaskRecord task, IReadOnlyList<string> repoNames, CancellationToken hostCt)
+    {
+        using var perTaskCts = CancellationTokenSource.CreateLinkedTokenSource(hostCt);
+        _registry.Register(task.Id, perTaskCts);
+        try
+        {
+            // A resumed task carries a checkpoint; a fresh one returns null here.
+            var checkpoint = await _store.GetCheckpointAsync(task.Id, hostCt);
+            var outcome = await _runner.RunAsync(task, perTaskCts.Token, checkpoint);
+            await _store.CompleteAsync(task.Id, outcome, hostCt);
+        }
+        catch (OperationCanceledException) when (!hostCt.IsCancellationRequested)
+        {
+            _logger.LogWarning("Task {Id} cancelled by user", task.Id);
+            await CancelAndCleanupAsync(task.Id, task.RepoSpec, "cancelled by user");
+        }
+        catch (OperationCanceledException)
+        {
+            // Host shutting down: leave the doc in running/ to be reconciled on next start.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Task {Id} threw", task.Id);
+            try { await _store.FailAsync(task.Id, ex.ToString(), CancellationToken.None); } catch { }
+        }
+        finally
+        {
+            _registry.Unregister(task.Id);
+            lock (_gate)
+            {
+                foreach (var r in repoNames) _busyRepos.Remove(r);
+                _inFlight.Remove(task.Id);
+            }
+        }
     }
 
     // Any task sitting in running/ at startup is an orphan: the process that owned it is

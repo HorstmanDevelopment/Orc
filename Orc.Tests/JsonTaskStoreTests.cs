@@ -104,6 +104,40 @@ public class JsonTaskStoreTests
     }
 
     [Fact]
+    public async Task ClaimNext_with_predicate_skips_rejected_specs()
+    {
+        using var ws = new TempWorkspace();
+        var store = Build(ws);
+        await store.EnqueueAsync(NewRecord("t_busy", spec: "repoA"), CancellationToken.None);
+        await store.EnqueueAsync(NewRecord("t_free", spec: "repoB"), CancellationToken.None);
+
+        // repoA is "busy": the older task is passed over and the next claimable one wins.
+        var claimed = await store.ClaimNextAsync(spec => spec != "repoA", CancellationToken.None);
+        Assert.NotNull(claimed);
+        Assert.Equal("t_free", claimed!.Id);
+
+        // The skipped task stays pending and is claimable once its repo frees up.
+        var pending = await store.ListAsync(TaskState.Pending, CancellationToken.None);
+        Assert.Single(pending);
+        Assert.Equal("t_busy", pending[0].Id);
+
+        var next = await store.ClaimNextAsync(spec => true, CancellationToken.None);
+        Assert.Equal("t_busy", next!.Id);
+    }
+
+    [Fact]
+    public async Task ClaimNext_with_predicate_returns_null_when_all_rejected()
+    {
+        using var ws = new TempWorkspace();
+        var store = Build(ws);
+        await store.EnqueueAsync(NewRecord("t_busy", spec: "repoA"), CancellationToken.None);
+
+        var claimed = await store.ClaimNextAsync(_ => false, CancellationToken.None);
+        Assert.Null(claimed);
+        Assert.Single(await store.ListAsync(TaskState.Pending, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task Purge_deletes_records_in_state()
     {
         using var ws = new TempWorkspace();

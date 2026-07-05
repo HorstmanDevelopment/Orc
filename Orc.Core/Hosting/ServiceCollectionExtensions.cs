@@ -18,6 +18,7 @@ public static class ServiceCollectionExtensions
         services.Configure<ClaudeOptions>(config.GetSection(ClaudeOptions.Section));
         services.Configure<OrchitectOptions>(config.GetSection(OrchitectOptions.Section));
         services.Configure<ResumeOptions>(config.GetSection(ResumeOptions.Section));
+        services.Configure<OrchestratorOptions>(config.GetSection(OrchestratorOptions.Section));
 
         services.AddSingleton<WorkspaceLayout>();
         services.AddSingleton<IProcessRunner, ProcessRunner>();

@@ -13,6 +13,14 @@ public interface ITaskStore
     Task TrackAsync(TaskRecord task, CancellationToken ct);
 
     Task<TaskRecord?> ClaimNextAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Claim the oldest pending task whose <c>RepoSpec</c> passes <paramref name="canClaim"/>,
+    /// skipping any that fail it. Lets the orchestrator pass over tasks whose target repos are
+    /// already busy, so it can run one task per repo in parallel while never running two tasks
+    /// against the same repo at once.
+    /// </summary>
+    Task<TaskRecord?> ClaimNextAsync(Func<string, bool> canClaim, CancellationToken ct);
     Task CompleteAsync(string id, TaskOutcome outcome, CancellationToken ct);
     Task FailAsync(string id, string reason, CancellationToken ct);
     Task<IReadOnlyList<TaskHeader>> ListAsync(TaskState state, CancellationToken ct);

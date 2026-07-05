@@ -49,30 +49,33 @@ internal sealed class JsonTaskStore : ITaskStore
         StateChanged?.Invoke(header);
     }
 
-    public async Task<TaskRecord?> ClaimNextAsync(CancellationToken ct)
+    public Task<TaskRecord?> ClaimNextAsync(CancellationToken ct) =>
+        ClaimNextAsync(static _ => true, ct);
+
+    public async Task<TaskRecord?> ClaimNextAsync(Func<string, bool> canClaim, CancellationToken ct)
     {
-        string? source = null;
         string? dest = null;
         StoredTask? doc = null;
 
         lock (_claimLock)
         {
+            // Oldest-first, but skip any whose repo-spec the caller rejects (repo busy). The
+            // doc read is lazy, so we only pay for files up to the first claimable one.
             var candidate = Directory.EnumerateFiles(DirFor(TaskState.Pending), "*.json")
                 .OrderBy(f => File.GetCreationTimeUtc(f))
-                .FirstOrDefault();
-            if (candidate is null) return null;
+                .Select(f => (path: f, doc: ReadDoc(f)))
+                .FirstOrDefault(c => c.doc is not null && canClaim(c.doc.Header.RepoSpec));
+            if (candidate.doc is null) return null;
 
             try
             {
-                doc = ReadDoc(candidate);
-                if (doc is null) return null;
-                source = candidate;
+                doc = candidate.doc;
                 dest = PathFor(TaskState.Running, doc.Header.Id);
-                File.Move(candidate, dest);
+                File.Move(candidate.path, dest);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "claim failed for {Path}", candidate);
+                _logger.LogWarning(ex, "claim failed for {Path}", candidate.path);
                 return null;
             }
         }
