@@ -104,6 +104,14 @@ internal sealed class OrchestratorService : BackgroundService
         {
             if (hostCt.IsCancellationRequested) return;
 
+            // Analysis/planning are tracked-only: they never branch, so there is nothing to
+            // resume and no git state to clean up. Just fail the stale doc.
+            if (o.Source.IsTrackedOnly)
+            {
+                try { await _store.FailAsync(o.Id, "orphaned by restart (tracked-only run)", hostCt); } catch { }
+                continue;
+            }
+
             var cp = await _store.GetCheckpointAsync(o.Id, hostCt);
             if (IsResumable(cp))
             {

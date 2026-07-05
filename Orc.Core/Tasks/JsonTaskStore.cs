@@ -40,6 +40,15 @@ internal sealed class JsonTaskStore : ITaskStore
         return task.Id;
     }
 
+    public async Task TrackAsync(TaskRecord task, CancellationToken ct)
+    {
+        var header = new TaskHeader(task.Id, task.Source, task.RepoSpec, TaskState.Running, task.CreatedUtc, null, null);
+        var doc = new StoredTask(header, task.Prompt);
+        await WriteAtomicAsync(PathFor(TaskState.Running, task.Id), doc, ct);
+        _logger.LogInformation("Tracking task {Id} src={Source} spec={Spec}", task.Id, task.Source, task.RepoSpec);
+        StateChanged?.Invoke(header);
+    }
+
     public async Task<TaskRecord?> ClaimNextAsync(CancellationToken ct)
     {
         string? source = null;

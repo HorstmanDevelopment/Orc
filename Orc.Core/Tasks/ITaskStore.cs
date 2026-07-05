@@ -3,6 +3,15 @@ namespace Orc.Core.Tasks;
 public interface ITaskStore
 {
     Task<string> EnqueueAsync(TaskRecord task, CancellationToken ct);
+
+    /// <summary>
+    /// Record a task that is already executing directly into running/ (bypassing the
+    /// pending → claim path). Used for tracked-only Claude runs (analysis/planning) that
+    /// Orchitect runs itself but wants surfaced in the running-task views. Finalize with
+    /// <see cref="CompleteAsync"/> / <see cref="FailAsync"/> like any other running task.
+    /// </summary>
+    Task TrackAsync(TaskRecord task, CancellationToken ct);
+
     Task<TaskRecord?> ClaimNextAsync(CancellationToken ct);
     Task CompleteAsync(string id, TaskOutcome outcome, CancellationToken ct);
     Task FailAsync(string id, string reason, CancellationToken ct);

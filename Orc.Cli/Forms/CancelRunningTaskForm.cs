@@ -65,10 +65,20 @@ public sealed class CancelRunningTaskForm
         AnsiConsole.WriteLine();
 
         AnsiConsole.MarkupLine("[red]This will:[/]");
-        AnsiConsole.MarkupLine("  [red]·[/] kill the running claude process and its pipeline");
-        AnsiConsole.MarkupLine("  [red]·[/] force-checkout each repo back to its base branch (discards uncommitted edits)");
-        AnsiConsole.MarkupLine("  [red]·[/] delete the partial [yellow]orc-task/...[/] branch(es)");
-        AnsiConsole.MarkupLine("  [red]·[/] move the task to [yellow]failed/[/] with reason \"cancelled by user\"");
+        if (header.Source.IsTrackedOnly)
+        {
+            // analysis/planning run in the live tree with no branch — nothing to unwind.
+            AnsiConsole.MarkupLine("  [red]·[/] kill the running claude process for this analysis/planning run");
+            AnsiConsole.MarkupLine("  [red]·[/] move the task to [yellow]failed/[/] with reason \"cancelled by user\"");
+            AnsiConsole.MarkupLine("  [grey](no git changes to unwind; Orchitect will re-run it on its next cycle)[/]");
+        }
+        else
+        {
+            AnsiConsole.MarkupLine("  [red]·[/] kill the running claude process and its pipeline");
+            AnsiConsole.MarkupLine("  [red]·[/] force-checkout each repo back to its base branch (discards uncommitted edits)");
+            AnsiConsole.MarkupLine("  [red]·[/] delete the partial [yellow]orc-task/...[/] branch(es)");
+            AnsiConsole.MarkupLine("  [red]·[/] move the task to [yellow]failed/[/] with reason \"cancelled by user\"");
+        }
         AnsiConsole.WriteLine();
 
         if (!AnsiConsole.Confirm($"Cancel task [yellow]{Markup.Escape(header.Id)}[/]?", false))

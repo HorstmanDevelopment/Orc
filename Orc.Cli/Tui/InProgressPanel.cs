@@ -15,6 +15,7 @@ public static class InProgressPanel
             .Border(TableBorder.Minimal)
             .Expand()
             .AddColumn("[yellow]Task[/]")
+            .AddColumn("[yellow]Type[/]")
             .AddColumn("[yellow]Source[/]")
             .AddColumn("[yellow]Repos[/]")
             .AddColumn("[yellow]Elapsed[/]");
@@ -34,6 +35,7 @@ public static class InProgressPanel
 
             table.AddRow(
                 Markup.Escape(t.Id),
+                KindCell(t.Source.Kind),
                 Markup.Escape(t.Source.ToString()),
                 Markup.Escape(t.RepoSpec),
                 elapsedCell);
@@ -49,4 +51,15 @@ public static class InProgressPanel
             .Header(headerTitle, Justify.Left)
             .Expand();
     }
+
+    // Distinguish the three kinds of Claude run at a glance: code-modifying pipeline tasks
+    // (user/orchitect) vs. Orchitect's non-git analysis/planning runs.
+    private static string KindCell(string kind) => kind switch
+    {
+        "user" => "[green]modify[/]",
+        "orchitect" => "[green]modify[/]",
+        "analysis" => "[blue]analyze[/]",
+        "planning" => "[magenta]plan[/]",
+        _ => Markup.Escape(kind),
+    };
 }

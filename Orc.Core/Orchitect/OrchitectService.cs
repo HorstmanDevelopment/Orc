@@ -16,6 +16,7 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
     private readonly AnalysisRunner _analysis;
     private readonly StepPlanner _planner;
     private readonly ITaskStore _tasks;
+    private readonly IRunningTaskRegistry _running;
     private readonly WorkspaceLayout _layout;
     private readonly OrchitectOptions _options;
     private readonly ILogger<OrchitectService> _logger;
@@ -30,6 +31,7 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
         AnalysisRunner analysis,
         StepPlanner planner,
         ITaskStore tasks,
+        IRunningTaskRegistry running,
         WorkspaceLayout layout,
         IOptions<OrchitectOptions> options,
         ILogger<OrchitectService> logger)
@@ -40,6 +42,7 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
         _analysis = analysis;
         _planner = planner;
         _tasks = tasks;
+        _running = running;
         _layout = layout;
         _options = options.Value;
         _logger = logger;
@@ -144,7 +147,13 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
                     if (!_quota.CanModify(repo.Name)) { await DelayUntilNextDayAsync(ct); continue; }
 
                     _logger.LogInformation("[{Repo}] analyzing", repo.Name);
-                    var (enhancements, raw) = await _analysis.RunAsync(repo.Name, repo.LocalPath, repo.Mission, ct);
+                    var (enhancements, raw) = await TrackedRunAsync(
+                        NewTrackedId("analysis", repo.Name),
+                        TaskSource.Analysis(repo.Name),
+                        repo.Name,
+                        "Orchitect: analyze repository for enhancement candidates",
+                        token => _analysis.RunAsync(repo.Name, repo.LocalPath, repo.Mission, token),
+                        ct);
                     try { await File.WriteAllTextAsync(_state.AnalysisPath(repo.Name), raw, ct); } catch { }
                     state.LastAnalyzedUtc = DateTime.UtcNow;
 
@@ -171,7 +180,13 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
                 if (enh is null) { await Task.Delay(TimeSpan.FromMinutes(5), ct); continue; }
 
                 _logger.LogInformation("[{Repo}] planning step for {Id} '{Title}'", repo.Name, enh.Id, enh.Title);
-                var plan = await _planner.PlanAsync(repo.Name, repo.LocalPath, enh, repo.Mission, ct);
+                var plan = await TrackedRunAsync(
+                    NewTrackedId($"planning_{enh.Id}", repo.Name),
+                    TaskSource.Planning(repo.Name, enh.Id),
+                    repo.Name,
+                    $"Orchitect: plan next step for {enh.Id} '{enh.Title}'",
+                    token => _planner.PlanAsync(repo.Name, repo.LocalPath, enh, repo.Mission, token),
+                    ct);
                 if (plan.IsComplete)
                 {
                     enh.Status = EnhancementStatus.Completed;
@@ -239,6 +254,12 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
                 }
             }
             catch (OperationCanceledException) { throw; }
+            catch (TrackedRunCanceledException)
+            {
+                // A user cancelled the current analysis/planning run (not host shutdown).
+                // Skip this cycle and re-evaluate from the top of the loop.
+                _logger.LogInformation("[{Repo}] tracked run cancelled by user; continuing", repo.Name);
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[{Repo}] loop error", repo.Name);
@@ -264,4 +285,61 @@ internal sealed class OrchitectService : BackgroundService, IOrchitectControl
         var stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         return $"orchitect_{repo}_{enhId}_s{stepN}_{stamp}";
     }
+
+    private static string NewTrackedId(string kind, string repo)
+    {
+        var stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        return $"orchitect_{repo}_{kind}_{stamp}";
+    }
+
+    /// <summary>
+    /// Records a non-pipeline Claude run (analysis/planning) in the task store so it shows
+    /// up in the running-task views, running it under a per-run cancellation source so the
+    /// "Cancel running task" UI can stop it. A user cancel (as opposed to host shutdown)
+    /// surfaces as <see cref="TrackedRunCanceledException"/> so the repo loop can continue
+    /// rather than tear down.
+    /// </summary>
+    private async Task<T> TrackedRunAsync<T>(
+        string taskId, TaskSource source, string repoName, string prompt,
+        Func<CancellationToken, Task<T>> work, CancellationToken ct)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _running.Register(taskId, cts);
+        try
+        {
+            var record = new TaskRecord(taskId, source, repoName, prompt, DateTime.UtcNow);
+            await _tasks.TrackAsync(record, ct);
+            try
+            {
+                var result = await work(cts.Token);
+                await _tasks.CompleteAsync(
+                    taskId,
+                    new TaskOutcome(true, false, [new RepoResult(repoName, 0, false, null, null)], null),
+                    CancellationToken.None);
+                return result;
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                await _tasks.FailAsync(taskId, "cancelled by user", CancellationToken.None);
+                throw new TrackedRunCanceledException();
+            }
+            catch (OperationCanceledException)
+            {
+                await _tasks.FailAsync(taskId, "cancelled (host shutdown)", CancellationToken.None);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                await _tasks.FailAsync(taskId, ex.ToString(), CancellationToken.None);
+                throw;
+            }
+        }
+        finally
+        {
+            _running.Unregister(taskId);
+        }
+    }
+
+    /// <summary>Signals that a tracked-only run was cancelled by the user (not host shutdown).</summary>
+    private sealed class TrackedRunCanceledException : Exception;
 }
